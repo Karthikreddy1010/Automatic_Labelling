@@ -1,0 +1,18 @@
+{
+  "weights": {
+    "false_positive": 30,
+    "missed_pole": 40,
+    "hard_negative": 20,
+    "confirmed_negative": 0,
+    "bad_obb": 20,
+    "dino_sam_disagreement": 25,
+    "poor_sam_mask": 20,
+    "heavy_occlusion": 15,
+    "small_distant_pole": 15,
+    "unusual_viewpoint": 10,
+    "image_boundary_pole": 10,
+    "near_duplicate": -25
+  },
+  "duplicate_phash_threshold": 8,
+  "max_priority": 100
+}

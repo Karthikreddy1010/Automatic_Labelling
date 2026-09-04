@@ -1,0 +1,126 @@
+# Electric Utility Pole Detection - Configuration
+project:
+  name: "Electric Utility Pole Detection"
+  version: "1.0.0"
+  description: "Automated utility pole detection, segmentation, and attribute estimation using GSV images"
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  annotations_dir: "data/annotations"
+  output_dir: "output"
+  
+  # Dataset splits
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  
+  # Image specifications (GSV standard)
+  image_width: 640
+  image_height: 640
+  
+  # GSV API settings
+  gsv_api_key: "${GSV_API_KEY}"  # Environment variable
+  max_images_per_location: 8
+  default_fov: 90  # degrees
+  camera_height: 2.5  # meters (standard GSV camera height)
+
+model:
+  # YOLOv8 configuration
+  yolo:
+    model_name: "yolov8x-seg.pt"  # Pre-trained X model for segmentation
+    epochs: 100
+    batch_size: 16
+    imgsz: 640
+    lr0: 0.01
+    patience: 20  # Early stopping patience
+    device: "cuda"  # or "cpu"
+    
+  # Mask R-CNN configuration
+  mask_rcnn:
+    backbone: "resnet50_fpn"
+    pretrained: true
+    batch_size: 4
+    
+  # Faster R-CNN configuration
+  faster_rcnn:
+    backbone: "resnet50_fpn"
+    pretrained: true
+    
+  # DETR configuration
+  detr:
+    backbone: "resnet50"
+    num_queries: 100
+    
+  # U-Net configuration (for segmentation)
+  unet:
+    channels: 3
+    output_channels: 1
+
+training:
+  optimizer: "adamw"
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  momentum: 0.9
+  scheduler: "cosine_annealing"
+  
+  # Data augmentation
+  augmentations:
+    - type: "random_rotation"
+      degrees: [-15, 15]
+    - type: "random_brightness"
+      factor: [0.8, 1.2]
+    - type: "random_contrast"
+      factor: [0.8, 1.2]
+    - type: "random_crop"
+      scale: [0.9, 1.0]
+    - type: "horizontal_flip"
+      probability: 0.5
+
+evaluation:
+  metrics:
+    - "mAP@50"
+    - "mAP@50:95"
+    - "precision"
+    - "recall"
+    - "F1_score"
+    - "IoU"
+    
+  # Attribute estimation thresholds
+  height_tolerance: 0.5  # meters
+  tilt_tolerance: 5.0  # degrees
+
+attribute_extraction:
+  reference_objects:
+    human_height: 1.7  # meters
+    stop_sign_height: 2.5  # meters
+    vehicle_height: 1.5  # meters
+    
+  camera:
+    focal_length_pixels: null  # Will be estimated from metadata
+    sensor_width_mm: 6.4  # Typical GSV camera sensor width
+    image_width_px: 640
+
+output:
+  model_dir: "models"
+  results_dir: "output/results"
+  plots_dir: "output/plots"
+  csv_export: true
+  json_export: true
+  
+  # CSV columns for export
+  export_columns:
+    - "image_path"
+    - "pole_id"
+    - "latitude"
+    - "longitude"
+    - "heading"
+    - "confidence"
+    - "height_meters"
+    - "tilt_degrees"
+    - "width_pixels"
+
+logging:
+  level: "INFO"
+  file: "output/training.log"
+  console: true

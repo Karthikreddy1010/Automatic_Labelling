@@ -1,0 +1,68 @@
+# =====================================================================
+# .gitignore - Electric Utility Pole OBB Annotation Platform
+# =====================================================================
+
+# 1. Images (Exclude all image files from git)
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.svg
+*.ico
+
+# 2. Markdown Files (As requested: do not push .md files)
+*.md
+**/*.md
+# Note: If you ever want to keep the main README on GitHub, add: !README.md
+
+# 3. Large Datasets & Media Directories
+Dataset/
+Final_Dataset/
+Final_Dataset_refined/
+Final_Dataset_allpole/
+data/raw/
+data/processed/
+data/datasets/
+pole_data_extracted/
+eval_upload/
+output/
+graphify-out/
+.tmp/
+
+# 4. Model Weights & Checkpoints (Heavy binary files)
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.engine
+*.tflite
+runs/
+models/*.pt
+models/*.pth
+models/yolo*.pt
+
+# 5. Python & Environment Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+ENV/
+
+# 6. Logs & Operating System Files
+*.log
+nohup.out
+.DS_Store
+Thumbs.db
+Desktop.ini
