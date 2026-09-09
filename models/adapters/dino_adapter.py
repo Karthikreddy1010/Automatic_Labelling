@@ -99,7 +99,9 @@ class GroundingDINOAdapter(BaseDetector):
         image: Union[str, np.ndarray],
         conf_threshold: float = 0.30,
         iou_threshold: float = 0.5,
-        imgsz: int = 1280
+        imgsz: int = 1280,
+        text_threshold: Optional[float] = None,
+        max_candidates: Optional[int] = None,
     ) -> List[DetectionBox]:
         if self.model is None or self.proc is None:
             ok = self.load(self.device)
@@ -121,6 +123,7 @@ class GroundingDINOAdapter(BaseDetector):
             return []
 
         effective_box_thr = max(conf_threshold, self.box_threshold)
+        effective_text_thr = text_threshold if text_threshold is not None else self.text_threshold
 
         try:
             inp = self.proc(images=pil_img, text=self.text_prompt, return_tensors="pt").to(
@@ -133,7 +136,7 @@ class GroundingDINOAdapter(BaseDetector):
                 out,
                 inp["input_ids"],
                 threshold=effective_box_thr,
-                text_threshold=self.text_threshold,
+                text_threshold=effective_text_thr,
                 target_sizes=[pil_img.size[::-1]]
             )[0]
 
@@ -163,6 +166,9 @@ class GroundingDINOAdapter(BaseDetector):
                     review_reasons=reasons,
                 )
                 dets.append(det)
+
+            if max_candidates is not None:
+                dets = sorted(dets, key=lambda d: d.confidence, reverse=True)[:max_candidates]
 
             return dets
         except Exception as e:

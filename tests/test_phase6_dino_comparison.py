@@ -4,8 +4,9 @@ tests/test_phase6_dino_comparison.py - Phase 6 Grounding DINO & Comparison Tests
 
 Tests:
 - Real Grounding DINO inference with open-vocabulary utility pole prompts
-- Fallback logic: triggers when YOLO is uncertain / produces no boxes
-- Model comparison: separate model channels preserved in raw_outputs
+- AI_LABEL production pipeline: DINO -> dedup -> SAM, never calls YOLO
+- Model comparison (RUN_ALL, YOLO_FAST): separate model channels preserved
+  in raw_outputs -- benchmark-only, not part of the production path
 """
 
 import time
@@ -55,14 +56,26 @@ class TestPhase6DINO(unittest.TestCase):
         self.assertIn("dino", raw_all, "RUN_ALL must preserve raw DINO output")
         self.assertGreaterEqual(len(reconciled_all), 1)
 
-        # Test AI_LABEL primary mode (DINO is primary)
+        # AI_LABEL is the production pipeline: DINO -> dedup -> (SAM, skipped
+        # here via use_sam_refinement=False) -- it must never call YOLO.
         reconciled_primary, raw_primary = run_ai_pipeline(
             img_path=img_path,
             mode="AI_LABEL",
             conf_threshold=0.25,
             use_sam_refinement=False
         )
-        self.assertIn("dino", raw_primary, "AI_LABEL must run DINO as primary object identifier")
+        self.assertNotIn("yolo", raw_primary, "AI_LABEL must never call YOLO (best.pt/A_S.pt)")
+        self.assertIn("dino", raw_primary, "AI_LABEL must run DINO")
+        self.assertIn("dino_raw_count", raw_primary)
+        self.assertIn("sam3_raw_count", raw_primary, "AI_LABEL must also try SAM3 as a candidate proposer")
+        self.assertIn("combined_deduped_count", raw_primary)
+        self.assertLessEqual(
+            raw_primary["combined_deduped_count"], raw_primary["dino_raw_count"] + raw_primary["sam3_raw_count"],
+            "dedup must never increase the combined candidate count",
+        )
+        for b in reconciled_primary:
+            self.assertEqual(b.model_source, "DINO")
+            self.assertTrue(b.needs_review, "un-refined DINO-only candidates should be flagged for review")
 
         # Test YOLO_FAST accelerator mode
         reconciled_fast, raw_fast = run_ai_pipeline(

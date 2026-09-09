@@ -63,7 +63,12 @@ class TestBackendAPI(unittest.TestCase):
         yolo_info = next(m for m in data["models"] if "YOLO" in m["name"])
         self.assertIn(yolo_info["status"], ["ready", "not_loaded", "missing_weights"])
         qwen_info = next(m for m in data["models"] if "Qwen" in m["name"])
-        self.assertEqual(qwen_info["status"], "unavailable")
+        # "ready" when a local Ollama vision-capable Qwen model is pulled/reachable
+        # on the machine running the tests, "unavailable" otherwise -- both are
+        # legitimate, honestly-reported states (never mocked), so assert the
+        # endpoint returns clean structure rather than assuming one fixed
+        # environment state.
+        self.assertIn(qwen_info["status"], ["ready", "unavailable"])
 
     def test_dataset_lifecycle_and_annotations(self):
         """Test dataset creation, annotation saving, and differential tracking via API."""

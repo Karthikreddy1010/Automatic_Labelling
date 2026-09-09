@@ -45,6 +45,14 @@ from models.adapters.sam3_adapter import SAM3Adapter
 from models.adapters.qwen_adapter import QwenVerifier
 from models.adapters.gemini_adapter import GeminiVerifier
 from models.adapters.reconciliation import reconcile_candidates, get_confidence_category
+from models.adapters.quality import dedup_by_iou, score_pole_quality, DEDUP_IOU_THRESHOLD
+from models.adapters.geometry_qa import run_geometry_qa, config_from_dict as geometry_config_from_dict
+from models.adapters.decision_engine import (
+    evaluate_candidate,
+    compute_segmentation_score,
+    config_from_dict as decision_config_from_dict,
+)
+from models.adapters.obb_generator import generate_and_validate_obb
 from src.geometry_obb import (
     xyxy_to_obb_corners,
     mask_to_obb_corners,
@@ -57,12 +65,41 @@ storage_mgr = DatasetManager()
 active_device = "AUTO"
 
 # Model Adapters
-yolo_adapter = YOLOAdapter()
+# Prefer the trained pole-specific OBB detector over the generic candidate
+# weights in YOLOAdapter.DEFAULT_CANDIDATE_PATHS when it's present.
+_TRAINED_YOLO_OBB_WEIGHTS = "models/best.pt"
+yolo_adapter = YOLOAdapter(
+    weights_path=_TRAINED_YOLO_OBB_WEIGHTS if os.path.exists(_TRAINED_YOLO_OBB_WEIGHTS) else None
+)
 dino_adapter = GroundingDINOAdapter()
 sam21_adapter = SAM21Adapter()
 sam3_adapter = SAM3Adapter()
 qwen_verifier = QwenVerifier()
 gemini_verifier = GeminiVerifier()
+
+
+def _load_verification_pipeline_config() -> Dict[str, Any]:
+    """
+    Load configs/config.yaml's `verification_pipeline` section (geometry QA
+    thresholds, decision weights, Qwen gating default). Never crashes on a
+    missing file or missing section -- geometry_qa.py/decision_engine.py's
+    dataclasses already default every field, so a partial or absent config
+    just falls back to those documented starting values.
+    """
+    cfg_path = Path(__file__).resolve().parent.parent / "configs" / "config.yaml"
+    try:
+        import yaml
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            full_cfg = yaml.safe_load(f) or {}
+        return full_cfg.get("verification_pipeline", {}) or {}
+    except Exception:
+        return {}
+
+
+_verification_cfg = _load_verification_pipeline_config()
+GEOMETRY_QA_CONFIG = geometry_config_from_dict(_verification_cfg.get("geometry_qa"))
+DECISION_CONFIG = decision_config_from_dict(_verification_cfg.get("decision"))
+QWEN_GATING_DEFAULT = (_verification_cfg.get("qwen") or {}).get("gating", "gated")
 
 
 # --- BATCH ENGINE STATE ---
@@ -82,6 +119,7 @@ class BatchJobState:
         self.start_time: Optional[float] = None
         self.stop_requested: bool = False
         self.pause_requested: bool = False
+        self.error_message: Optional[str] = None
 
     def reset(self):
         with self.lock:
@@ -98,6 +136,7 @@ class BatchJobState:
             self.start_time = None
             self.stop_requested = False
             self.pause_requested = False
+            self.error_message = None
 
     def to_dict(self) -> Dict[str, Any]:
         with self.lock:
@@ -115,6 +154,7 @@ class BatchJobState:
                 "avg_confidence": avg_conf,
                 "current_filename": self.current_filename,
                 "elapsed_seconds": elapsed,
+                "error_message": self.error_message,
             }
 
 
@@ -190,9 +230,13 @@ class DetectionRequest(BaseModel):
     dataset_id: str
     filename: str
     mode: str = Field("AI_LABEL", description="'AI_LABEL', 'RUN_ALL', 'YOLO_ONLY', 'DINO_ONLY', 'SAM_ONLY'")
-    conf_threshold: float = 0.25
+    conf_threshold: float = Field(0.25, description="DINO box_threshold (also used as YOLO conf in benchmark modes)")
     iou_threshold: float = 0.50
     use_sam_refinement: bool = True
+    text_threshold: Optional[float] = Field(None, description="DINO text_threshold override; defaults to the adapter's configured value")
+    max_candidates: Optional[int] = Field(None, description="Cap on raw DINO candidates before dedup; defaults to DINO_MAX_RAW_CANDIDATES")
+    enable_geometry_qa: bool = Field(True, description="Run geometry_qa.py on each SAM-refined candidate (disable for baseline A/B comparison)")
+    qwen_gating: Optional[str] = Field(None, description="'off' | 'gated' | 'always' -- overrides configs/config.yaml verification_pipeline.qwen.gating for this request")
 
 
 class SegmentBoxRequest(BaseModel):
@@ -231,6 +275,8 @@ class BatchStartRequest(BaseModel):
     conf_threshold: float = 0.25
     only_unlabeled: bool = True
     use_sam_refinement: bool = True
+    enable_geometry_qa: bool = True
+    qwen_gating: Optional[str] = None
 
 
 # --- HARDWARE & SYSTEM ENDPOINTS ---
@@ -483,15 +529,230 @@ def update_al_weights_endpoint(req: ActiveLearningWeightsRequest):
     return {"message": "Weights updated", "config": saved}
 
 
+@app.get("/api/config/verification_pipeline")
+def get_verification_pipeline_config():
+    """Read-only view of the loaded geometry QA / decision engine / Qwen gating
+    configuration (configs/config.yaml verification_pipeline section), for the
+    frontend's provenance panel and for the benchmark harness to log exact
+    settings alongside its results."""
+    return {
+        "qwen_gating_default": QWEN_GATING_DEFAULT,
+        "geometry_qa": dict(GEOMETRY_QA_CONFIG.__dict__),
+        "decision": {
+            "weights": DECISION_CONFIG.weights.as_dict(),
+            "accept_threshold": DECISION_CONFIG.accept_threshold,
+            "review_threshold": DECISION_CONFIG.review_threshold,
+            "semantic_reject_confidence": DECISION_CONFIG.semantic_reject_confidence,
+        },
+    }
+
+
 @app.get("/api/datasets/{dataset_id}/masks/{mask_filename}")
 def serve_cached_mask(dataset_id: str, mask_filename: str):
-    p = storage_mgr.base_dir / dataset_id / "masks" / mask_filename
-    if not p.exists():
+    p = storage_mgr.get_cached_mask_file_path(dataset_id, mask_filename)
+    if not p:
         raise HTTPException(status_code=404, detail="Mask not found.")
     return FileResponse(str(p), media_type="image/png")
 
 
 # --- AI INFERENCE ENGINE ---
+
+YOLO_CONFIDENT_THRESHOLD = 0.55  # used by YOLO_FAST/YOLO_ONLY/RUN_ALL benchmarking only
+
+# --- Production pipeline knobs (single source of truth; do not hard-code
+# these elsewhere -- pass overrides through DetectionRequest/BatchStartRequest). ---
+DINO_MAX_RAW_CANDIDATES = 12   # raw DINO detections considered before dedup
+SAM_REFINE_TOP_N = 5           # deduped candidates actually sent through SAM
+
+
+def _sam_refine_candidates(
+    candidates: List[DetectionBox],
+    img_path: Path,
+    dataset_id: Optional[str],
+    filename: Optional[str],
+    img_width: int,
+    img_height: int,
+    model_source: str = "DINO+SAM",
+) -> Tuple[List[DetectionBox], int, int]:
+    """
+    Refine up to SAM_REFINE_TOP_N deduped candidates (highest confidence
+    first) with SAM into a canonical rotated OBB, score each with
+    quality.score_pole_quality(), and drop REJECT-bucketed candidates
+    (obvious false positives) rather than returning them to the reviewer.
+
+    The resulting OBB is generated and structurally validated via
+    obb_generator.py (all corners in-bounds, non-self-intersecting, positive
+    area) -- a candidate whose geometry fails that validation is dropped
+    rather than silently handed a degenerate label. Each kept candidate keeps
+    its raw SAM mask on DetectionBox.mask (never serialized -- see
+    DetectionBox.to_dict) so the caller can run geometry QA without
+    re-running SAM.
+
+    Returns (kept_boxes, n_quality_rejected, n_invalid_obb).
+    """
+    result_boxes: List[DetectionBox] = []
+    n_rejected = 0
+    n_invalid_obb = 0
+    sorted_candidates = sorted(candidates, key=lambda b: b.confidence, reverse=True)[:SAM_REFINE_TOP_N]
+    for idx, det in enumerate(sorted_candidates):
+        mask = None
+        try:
+            if sam21_adapter.is_available():
+                mask = sam21_adapter.segment_box(str(img_path), det.xyxy)
+            elif sam3_adapter.is_available():
+                mask = sam3_adapter.segment_box(str(img_path), det.xyxy)
+        except Exception:
+            pass
+
+        quality = score_pole_quality(mask, det.xyxy, det.confidence)
+        if quality["category"] == "REJECT":
+            n_rejected += 1
+            continue
+
+        obb_result = generate_and_validate_obb(mask, det.xyxy, img_width, img_height)
+        if not obb_result["valid"]:
+            n_invalid_obb += 1
+            continue
+        new_corners = obb_result["corners"]
+
+        mask_rel_path = None
+        if mask is not None and dataset_id and filename:
+            try:
+                mask_rel_path = storage_mgr.save_mask(dataset_id, filename, idx, mask)
+            except Exception:
+                pass
+
+        if obb_result["source"] == "xyxy_fallback":
+            sam_quality = "failed"
+            mask_area = 0
+        else:
+            mask_area = int((mask > 0).sum()) if mask is not None else 0
+            sam_quality = "good" if mask_area > 50 else "poor"
+
+        enclosing_xyxy = obb_corners_to_xyxy(new_corners)
+        result_boxes.append(DetectionBox(
+            xyxy=enclosing_xyxy,
+            corners=new_corners.tolist(),
+            confidence=round(det.confidence, 3),
+            class_id=det.class_id,
+            class_name=det.class_name or "utility_pole",
+            model_source=model_source,
+            needs_review=(quality["category"] != "HIGH_QUALITY"),
+            review_reasons=quality["reasons"],
+            mask=mask,
+            attributes={
+                "sam_quality": sam_quality,
+                "mask_area": mask_area,
+                "mask_path": mask_rel_path,
+                "quality_score": quality["quality_score"],
+                "category": quality["category"],
+                "obb_source": obb_result["source"],
+            }
+        ))
+    return result_boxes, n_rejected, n_invalid_obb
+
+
+def _apply_verification(
+    candidates: List[DetectionBox],
+    img_path: Path,
+    img_width: int,
+    img_height: int,
+    enable_geometry_qa: bool = True,
+    qwen_gating: str = "gated",
+) -> Tuple[List[DetectionBox], Dict[str, int]]:
+    """
+    Stage 4 of the production pipeline (after SAM refinement): geometry QA +
+    Qwen3-VL semantic verification + the multi-signal decision engine.
+
+    Geometry QA (models/adapters/geometry_qa.py) reuses each candidate's
+    already-computed SAM mask (DetectionBox.mask, set by _sam_refine_candidates).
+    Qwen (models/adapters/qwen_adapter.py) is gated per `qwen_gating`:
+      "off"    -- never called (baseline/geometry-only comparison configs).
+      "gated"  -- skipped only for candidates geometry QA already hard-fails
+                  (saves a real VLM call on an already-doomed candidate);
+                  called otherwise.
+      "always" -- called on every surviving candidate (evaluation experiments).
+    Neither Qwen nor geometry QA ever produces OBB coordinates -- geometry is
+    already finalized by _sam_refine_candidates/obb_generator before this runs.
+
+    A REJECT decision from the combined decision engine drops the candidate
+    here (mirrors the existing SAM-quality REJECT drop) rather than showing
+    an AI-confirmed non-pole to the human reviewer. ACCEPT/REVIEW candidates
+    are kept and flagged via needs_review + attributes.decision.
+
+    Returns (kept_boxes, counts) where counts has n_semantic_rejected,
+    n_qwen_calls, n_disagreements.
+    """
+    counts = {
+        "n_semantic_rejected": 0, "n_qwen_calls": 0, "n_disagreements": 0,
+        # Distinguishes "gating requested Qwen but it never ran" reasons: a
+        # benchmark comparing configs must not read n_qwen_calls==0 as "Qwen
+        # rejected everything" when it's actually "Qwen wasn't reachable."
+        "qwen_available": qwen_verifier.is_available(),
+    }
+    kept: List[DetectionBox] = []
+
+    for det in candidates:
+        geometry_result = None
+        if enable_geometry_qa:
+            geometry_result = run_geometry_qa(det.mask, np.array(det.corners), img_width, img_height, GEOMETRY_QA_CONFIG)
+
+        geometry_hard_fail = bool(geometry_result and geometry_result["geometry_status"] == "fail")
+
+        should_call_qwen = (
+            qwen_gating == "always"
+            or (qwen_gating == "gated" and not geometry_hard_fail)
+        ) and qwen_gating != "off"
+
+        semantic_result = None
+        if should_call_qwen and qwen_verifier.is_available():
+            semantic_result = qwen_verifier.verify(str(img_path), det)
+            counts["n_qwen_calls"] += 1
+
+        segmentation_score = compute_segmentation_score(det.mask, det.xyxy)
+
+        decision_result = evaluate_candidate(
+            detection_score=det.confidence,
+            segmentation_score=segmentation_score,
+            geometry_result=geometry_result,
+            semantic_result=semantic_result,
+            obb_valid=True,  # already validated in _sam_refine_candidates
+            config=DECISION_CONFIG,
+        )
+
+        if decision_result["disagreements"]:
+            counts["n_disagreements"] += 1
+
+        det.attributes["segmentation_score"] = decision_result["segmentation_score"]
+        det.attributes["final_score"] = decision_result["final_score"]
+        det.attributes["decision"] = decision_result["decision"]
+        det.attributes["disagreements"] = decision_result["disagreements"]
+        if geometry_result:
+            det.attributes["geometry_score"] = geometry_result["geometry_score"]
+            det.attributes["geometry_status"] = geometry_result["geometry_status"]
+            det.attributes["geometry_flags"] = geometry_result["geometry_flags"]
+        if semantic_result:
+            det.attributes["qwen_class"] = decision_result["qwen_class"]
+            det.attributes["qwen_material"] = decision_result["qwen_material"]
+            det.attributes["qwen_visibility"] = decision_result["qwen_visibility"]
+            det.attributes["qwen_orientation"] = decision_result["qwen_orientation"]
+            det.attributes["qwen_semantic_confidence"] = semantic_result.get("semantic_confidence")
+            det.attributes["qwen_reason"] = decision_result["qwen_reason"]
+            det.attributes["qwen_ran"] = True
+        else:
+            det.attributes["qwen_ran"] = False
+
+        det.review_reasons = list(det.review_reasons) + decision_result["reasons"]
+        det.needs_review = decision_result["decision"] != "ACCEPT"
+        det.mask = None  # never needed past this point; keep DetectionBox light
+
+        if decision_result["decision"] == "REJECT":
+            counts["n_semantic_rejected"] += 1
+            continue
+        kept.append(det)
+
+    return kept, counts
+
 
 def run_ai_pipeline(
     img_path: Path,
@@ -501,86 +762,109 @@ def run_ai_pipeline(
     use_sam_refinement: bool = True,
     device: str = "AUTO",
     dataset_id: Optional[str] = None,
-    filename: Optional[str] = None
+    filename: Optional[str] = None,
+    text_threshold: Optional[float] = None,
+    max_candidates: Optional[int] = None,
+    enable_geometry_qa: bool = True,
+    qwen_gating: Optional[str] = None,
 ) -> Tuple[List[DetectionBox], Dict[str, Any]]:
     """
     Executes detection pipeline:
-    - AI_LABEL / DINO_SAM (Primary dataset generation):
-        1. Grounding DINO detects candidate bounding boxes.
-        2. SAM (SAM 2.1 or SAM 3) segments candidate box -> domain cleanup (_clean).
-        3. mask_to_obb_corners computes true canonical rotated OBB.
-        4. Mask saved to masks/ directory.
-        5. Separate scores (dino_confidence, sam_quality, mask_area) preserved.
-        6. Status starts as ai_suggested (needs_review=True).
-    - YOLO_FAST / YOLO_ONLY:
-        Optional accelerator using trained YOLOv8-OBB.
-    - RUN_ALL (Model comparison):
-        Executes YOLO + DINO + SAM, preserves raw outputs separately, and reconciles.
+    - AI_LABEL / DINO_SAM (production pipeline; intentionally does NOT call
+      YOLO/best.pt/A_S.pt):
+        1. Grounding DINO proposes candidate boxes (box_threshold via
+           conf_threshold, text_threshold, max_candidates all configurable
+           per-request -- see DINO_MAX_RAW_CANDIDATES for the raw cap).
+        2. Candidates deduped by IoU (dedup_by_iou) so one physical pole
+           doesn't produce multiple overlapping labels.
+        3. Each of the top SAM_REFINE_TOP_N deduped candidates is segmented
+           with SAM 2.1 (or SAM 3), scored with score_pole_quality(), and
+           REJECT-bucketed candidates are dropped. Survivors are flagged
+           needs_review unless HIGH_QUALITY. The resulting OBB is generated
+           from the mask and structurally validated (obb_generator.py).
+        4. Geometry QA (geometry_qa.py) + Qwen3-VL semantic verification
+           (qwen_adapter.py, gated by `qwen_gating`) + the multi-signal
+           decision engine (decision_engine.py) combine detection/
+           segmentation/geometry/semantic evidence into a final ACCEPT/
+           REVIEW/REJECT call per candidate (_apply_verification). Neither
+           stage ever touches the OBB geometry itself -- see
+           decision_engine.py's module docstring for why Qwen/geometry QA
+           are additive verification layers, not replacements for DINO/SAM3.
+      DINO_ONLY skips steps 3-4 entirely (raw deduped DINO boxes only).
+      If DINO or SAM/SAM3 is unavailable, returns raw_outputs["error"]
+      instead of silently falling back to any YOLO detector.
+    - YOLO_FAST / YOLO_ONLY: benchmark-only accelerator using best.pt, no
+      DINO fallback. Never used by AI_LABEL.
+    - RUN_ALL (Model comparison / benchmarking): Executes YOLO + DINO + SAM,
+      preserves raw outputs separately, and reconciles.
     """
     raw_outputs: Dict[str, Any] = {}
     yolo_boxes: List[DetectionBox] = []
     dino_boxes: List[DetectionBox] = []
     sam_boxes: List[DetectionBox] = []
 
-    # 1. PRIMARY WORKFLOW: Grounding DINO -> SAM -> Mask -> True OBB
+    # 0. PRODUCTION PIPELINE: Grounding DINO + SAM3 (candidate proposers) ->
+    # dedup -> SAM 2.1 refinement -> quality-scored OBB.
+    # YOLO (best.pt / A_S.pt) is intentionally never called here.
     if mode in ("AI_LABEL", "DINO_SAM", "DINO_ONLY"):
-        if dino_adapter.is_available():
-            dino_boxes = dino_adapter.predict(str(img_path), conf_threshold=conf_threshold, iou_threshold=iou_threshold)
-            raw_outputs["dino"] = [b.to_dict() for b in dino_boxes]
+        if not dino_adapter.is_available():
+            raw_outputs["error"] = "DINO unavailable"
+            return [], raw_outputs
 
-        result_boxes: List[DetectionBox] = []
-        if mode != "DINO_ONLY" and use_sam_refinement and (sam21_adapter.is_available() or sam3_adapter.is_available()):
-            # Run SAM on each DINO candidate box (limit to top 5 candidates on CPU)
-            sorted_dino = sorted(dino_boxes, key=lambda b: b.confidence, reverse=True)[:5]
-            for idx, det in enumerate(sorted_dino):
-                mask = None
-                new_corners = None
-                try:
-                    if sam21_adapter.is_available():
-                        mask, new_corners = sam21_adapter.segment_and_generate_obb(str(img_path), det.xyxy)
-                    elif sam3_adapter.is_available():
-                        mask = sam3_adapter.segment_box(str(img_path), det.xyxy)
-                        new_corners = mask_to_obb_corners(mask) if mask is not None else None
-                except Exception:
-                    pass
+        dino_boxes = dino_adapter.predict(
+            str(img_path), conf_threshold=conf_threshold, iou_threshold=iou_threshold,
+            text_threshold=text_threshold, max_candidates=max_candidates or DINO_MAX_RAW_CANDIDATES,
+        )
+        raw_outputs["dino_raw_count"] = len(dino_boxes)
 
-                mask_rel_path = None
-                if mask is not None and dataset_id and filename:
-                    try:
-                        mask_rel_path = storage_mgr.save_mask(dataset_id, filename, idx, mask)
-                    except Exception:
-                        pass
+        # SAM3 also proposes candidates via its own open-vocabulary
+        # detect+segment (facebook/sam3, text-prompted) -- reuses this
+        # repo's own gen_candidates.py pattern of merging DINO + SAM3
+        # proposals rather than trusting either alone. Its own mask is not
+        # used here; only its box is added to the shared candidate pool, so
+        # every surviving candidate (DINO- or SAM3-proposed) goes through
+        # the same SAM 2.1 refinement + quality-scoring path.
+        sam3_candidates: List[DetectionBox] = []
+        if sam3_adapter.is_available():
+            try:
+                sam3_candidates = sam3_adapter.detect_and_segment(str(img_path))
+            except Exception:
+                sam3_candidates = []
+        raw_outputs["sam3_raw_count"] = len(sam3_candidates)
 
-                if new_corners is None:
-                    new_corners = xyxy_to_obb_corners(*det.xyxy)
-                    sam_quality = "failed"
-                    mask_area = 0
-                else:
-                    mask_area = int((mask > 0).sum()) if mask is not None else 0
-                    sam_quality = "good" if mask_area > 50 else "poor"
+        combined_candidates = dedup_by_iou(dino_boxes + sam3_candidates, iou_threshold=DEDUP_IOU_THRESHOLD)
+        raw_outputs["dino"] = [b.to_dict() for b in dino_boxes]
+        raw_outputs["sam3_candidates"] = [b.to_dict() for b in sam3_candidates]
+        raw_outputs["combined_deduped_count"] = len(combined_candidates)
 
-                enclosing_xyxy = obb_corners_to_xyxy(new_corners)
-                result_boxes.append(DetectionBox(
-                    xyxy=enclosing_xyxy,
-                    corners=new_corners.tolist(),
-                    confidence=round(det.confidence, 3),
-                    class_id=0,
-                    class_name=det.class_name or "utility_pole",
-                    model_source="DINO+SAM",
-                    needs_review=True,
-                    review_reasons=["AI suggested candidate (DINO+SAM)"],
-                    attributes={
-                        "dino_confidence": round(det.confidence, 3),
-                        "sam_quality": sam_quality,
-                        "mask_area": mask_area,
-                        "mask_path": mask_rel_path,
-                        "model_agreement": False,
-                        "category": "YELLOW",
-                    }
-                ))
-            return result_boxes, raw_outputs
-        else:
-            return dino_boxes, raw_outputs
+        if mode == "DINO_ONLY" or not use_sam_refinement:
+            return combined_candidates, raw_outputs
+
+        if not (sam21_adapter.is_available() or sam3_adapter.is_available()):
+            raw_outputs["error"] = "SAM 2.1/SAM 3 unavailable"
+            return [], raw_outputs
+
+        with Image.open(str(img_path)) as _im:
+            img_width, img_height = _im.size
+
+        result_boxes, n_rejected, n_invalid_obb = _sam_refine_candidates(
+            combined_candidates, img_path, dataset_id, filename, img_width, img_height,
+            model_source="DINO+SAM3+SAM",
+        )
+        raw_outputs["n_sam_rejected"] = n_rejected
+        raw_outputs["n_invalid_obb"] = n_invalid_obb
+
+        gating = qwen_gating if qwen_gating is not None else QWEN_GATING_DEFAULT
+        result_boxes, verify_counts = _apply_verification(
+            result_boxes, img_path, img_width, img_height,
+            enable_geometry_qa=enable_geometry_qa, qwen_gating=gating,
+        )
+        raw_outputs["verification"] = {
+            "geometry_qa_enabled": enable_geometry_qa,
+            "qwen_gating": gating,
+            **verify_counts,
+        }
+        return result_boxes, raw_outputs
 
     # 2. OPTIONAL ACCELERATOR: YOLO / YOLO-OBB
     elif mode in ("YOLO_FAST", "YOLO_ONLY"):
@@ -647,8 +931,17 @@ def detect_single_image(req: DetectionRequest):
         use_sam_refinement=req.use_sam_refinement,
         device=resolved_dev,
         dataset_id=req.dataset_id,
-        filename=req.filename
+        filename=req.filename,
+        text_threshold=req.text_threshold,
+        max_candidates=req.max_candidates,
+        enable_geometry_qa=req.enable_geometry_qa,
+        qwen_gating=req.qwen_gating,
     )
+
+    if raw_outputs.get("error"):
+        # A required model is unavailable -- surface it clearly rather than
+        # silently returning an empty "no poles found" result.
+        raise HTTPException(status_code=503, detail=raw_outputs["error"])
 
     # Persist untouched raw predictions in predictions/
     storage_mgr.save_predictions(req.dataset_id, req.filename, reconciled, raw_outputs)
@@ -697,7 +990,9 @@ def _batch_worker(
     image_names: List[str],
     mode: str,
     conf_threshold: float,
-    use_sam_refinement: bool
+    use_sam_refinement: bool,
+    enable_geometry_qa: bool = True,
+    qwen_gating: Optional[str] = None,
 ):
     global batch_job
     resolved_dev, _ = detect_hardware(active_device)
@@ -729,8 +1024,23 @@ def _batch_worker(
                 mode=mode,
                 conf_threshold=conf_threshold,
                 use_sam_refinement=use_sam_refinement,
-                device=resolved_dev
+                device=resolved_dev,
+                dataset_id=dataset_id,
+                filename=name,
+                enable_geometry_qa=enable_geometry_qa,
+                qwen_gating=qwen_gating,
             )
+
+            if raw_outputs.get("error"):
+                # A required model is unavailable -- this will recur for
+                # every remaining image, so abort the batch now instead of
+                # silently saving empty "no poles found" predictions for 485
+                # images and burning the whole run on a dead model.
+                batch_job.failed_count += 1
+                batch_job.status = "failed"
+                batch_job.error_message = raw_outputs["error"]
+                batch_job.current_filename = None
+                return
 
             # Persist untouched predictions
             storage_mgr.save_predictions(dataset_id, name, reconciled, raw_outputs)
@@ -783,7 +1093,9 @@ def start_batch_job(req: BatchStartRequest, background_tasks: BackgroundTasks):
         image_names,
         req.mode,
         req.conf_threshold,
-        req.use_sam_refinement
+        req.use_sam_refinement,
+        req.enable_geometry_qa,
+        req.qwen_gating,
     )
 
     return {"message": "Batch auto-labeling job initiated", "job": batch_job.to_dict()}

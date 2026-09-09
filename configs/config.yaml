@@ -124,3 +124,47 @@ logging:
   level: "INFO"
   file: "output/training.log"
   console: true
+
+# --- Semantic + Geometric Verification Pipeline (DINO -> SAM3 -> mask cleanup
+# -> OBB -> Geometry QA -> Qwen3-VL -> decision engine) -----------------------
+# Loaded by backend/app.py at request time via models/adapters/geometry_qa.py
+# and models/adapters/decision_engine.py. Every threshold/weight here is a
+# starting point, not a claimed-optimal value -- tune against real
+# precision/recall once ground-truth validation data exists
+# (see benchmark_dino_sam.py --compare-verification).
+verification_pipeline:
+  qwen:
+    # "off"    -- never call Qwen (baseline DINO+SAM3[+GeometryQA] configs A/C)
+    # "gated"  -- skip Qwen only for candidates an earlier stage already
+    #             confidently rejects (geometry hard-fail); call it otherwise.
+    #             This is the efficient default for interactive/batch use.
+    # "always" -- call Qwen on every surviving candidate regardless of gating,
+    #             for A/B evaluation experiments (configs B/D).
+    gating: "gated"
+
+  geometry_qa:
+    max_image_area_fraction: 0.35
+    min_obb_length_px: 15.0
+    min_length_to_thickness: 1.6
+    warn_tilt_deg: 35.0
+    fail_tilt_deg: 65.0
+    min_mask_to_obb_ratio: 0.20
+    min_solidity: 0.30
+    min_mask_area_px: 40.0
+    fail_score_below: 0.30
+    warn_score_below: 0.60
+
+  decision:
+    # Do NOT just multiply these -- see decision_engine.py docstring. Weights
+    # are renormalized over whichever signals actually ran for a candidate
+    # (e.g. Qwen gated off), so they don't need to sum to exactly 1.0.
+    weights:
+      detection: 0.20
+      semantic: 0.35
+      geometry: 0.25
+      segmentation: 0.20
+    accept_threshold: 0.65
+    review_threshold: 0.35
+    # Qwen must be at least this confident (and not "uncertain") to drive a
+    # REJECT on semantics alone; below this it lands in REVIEW instead.
+    semantic_reject_confidence: 0.60

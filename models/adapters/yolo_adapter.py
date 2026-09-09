@@ -95,6 +95,10 @@ class YOLOAdapter(BaseDetector):
             resolved_dev, _ = detect_hardware(device)
             self.device = resolved_dev
             self.model = YOLO(self._resolved_weights)
+            # The loaded model's own task is authoritative; the filename-based
+            # guess in _check_weights() can be wrong for a trained model that
+            # doesn't happen to have "obb" in its filename (e.g. "best.pt").
+            self._is_obb = getattr(self.model, "task", None) == "obb"
             self._status = "ready"
             self._error_msg = None
             return True
