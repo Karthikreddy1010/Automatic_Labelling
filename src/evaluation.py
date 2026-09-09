@@ -213,35 +213,61 @@ class AttributeEvaluator:
 
 
 def generate_evaluation_report(
-    detection_metrics: DetectionMetrics,
-    height_errors: Dict[str, float],
-    tilt_errors: Dict[str, float]
+    detection_metrics: Optional[DetectionMetrics],
+    height_errors: Optional[Dict[str, float]],
+    tilt_errors: Optional[Dict[str, float]]
 ) -> str:
-    """Generate a formatted evaluation report."""
-    
+    """
+    Generate a formatted evaluation report.
+
+    Each section is computed only when its ground truth was actually
+    supplied; a section whose ground truth is missing is reported as
+    "not evaluated" rather than filled in with a placeholder number.
+    """
+    if detection_metrics is not None:
+        detection_section = (
+            f"  Precision:     {detection_metrics.precision:.4f}\n"
+            f"  Recall:        {detection_metrics.recall:.4f}\n"
+            f"  F1 Score:      {detection_metrics.f1_score:.4f}\n"
+            f"  mAP@50:        {detection_metrics.map_50:.4f}\n"
+            f"  mAP@50-95:     {detection_metrics.map_50_95:.4f}"
+        )
+    else:
+        detection_section = "  Not evaluated -- no ground-truth boxes were supplied."
+
+    if height_errors is not None:
+        height_section = (
+            f"  MAE (meters):      {height_errors['mae']:.4f}\n"
+            f"  RMSE (meters):     {height_errors['rmse']:.4f}\n"
+            f"  Within ±1m:        {height_errors['within_tolerance_1m']*100:.1f}%"
+        )
+    else:
+        height_section = "  Not evaluated -- no ground-truth heights were supplied."
+
+    if tilt_errors is not None:
+        tilt_section = (
+            f"  MAE (degrees):     {tilt_errors['mae']:.4f}\n"
+            f"  RMSE (degrees):    {tilt_errors['rmse']:.4f}\n"
+            f"  Within ±5°:        {tilt_errors['within_tolerance_5deg']*100:.1f}%"
+        )
+    else:
+        tilt_section = "  Not evaluated -- no ground-truth tilts were supplied."
+
     report = f"""
 {'='*60}
   POLE DETECTION & ATTRIBUTE ESTIMATION EVALUATION REPORT
 {'='*60}
 
 DETECTION PERFORMANCE:
-  Precision:     {detection_metrics.precision:.4f}
-  Recall:        {detection_metrics.recall:.4f}  
-  F1 Score:      {detection_metrics.f1_score:.4f}
-  mAP@50:        {detection_metrics.map_50:.4f}
-  mAP@50-95:     {detection_metrics.map_50_95:.4f}
+{detection_section}
 
 HEIGHT ESTIMATION:
-  MAE (meters):      {height_errors['mae']:.4f}
-  RMSE (meters):     {height_errors['rmse']:.4f}
-  Within ±1m:        {height_errors['within_tolerance_1m']*100:.1f}%
+{height_section}
 
 TILT ESTIMATION:
-  MAE (degrees):     {tilt_errors['mae']:.4f}
-  RMSE (degrees):    {tilt_errors['rmse']:.4f}
-  Within ±5°:        {tilt_errors['within_tolerance_5deg']*100:.1f}%
+{tilt_section}
 
 {'='*60}
 """
-    
+
     return report

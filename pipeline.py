@@ -228,35 +228,59 @@ class PoleDetectionPipeline:
         return str(self.output_dir / f"pole_detection_results.{format}")
     
     def run_evaluation(
-        self, 
+        self,
         attributes: List[PoleAttributes],
         ground_truth_heights: Optional[List[float]] = None,
-        ground_truth_tilts: Optional[List[float]] = None
+        ground_truth_tilts: Optional[List[float]] = None,
+        ground_truth_boxes: Optional[List[Dict]] = None,
     ) -> str:
-        """Run evaluation and generate report."""
-        
-        # Detection metrics (demo mode uses synthetic data)
-        detection_metrics = DetectionMetrics(
-            precision=0.92,
-            recall=0.87,
-            f1_score=0.895,
-            map_50=0.94,
-            map_50_95=0.76
-        )
-        
+        """
+        Run evaluation and generate report.
+
+        Each metric is only computed when its ground truth is actually
+        supplied by the caller -- there is no synthetic/placeholder fallback.
+        A metric whose ground truth is missing is reported as "not
+        evaluated" rather than a fabricated number.
+
+        Args:
+            ground_truth_boxes: one dict per ground-truth box, each with a
+                'bbox' key in (x1, y1, x2, y2) pixel format, aligned to the
+                same images as `attributes`. Required to compute detection
+                precision/recall/F1/mAP.
+        """
+        detection_metrics = None
+        if ground_truth_boxes:
+            predictions = [
+                {
+                    'bbox': (
+                        a.bounding_box[0],
+                        a.bounding_box[1],
+                        a.bounding_box[0] + a.bounding_box[2],
+                        a.bounding_box[1] + a.bounding_box[3],
+                    ),
+                    'confidence': a.confidence,
+                }
+                for a in attributes
+            ]
+            detection_metrics = DetectionEvaluator.evaluate_detection(
+                predictions, ground_truth_boxes
+            )
+
         # Attribute evaluation
-        predicted_heights = [a.height_meters for a in attributes if a.height_meters is not None]
-        true_heights = ground_truth_heights or np.random.uniform(8, 14, len(predicted_heights)).tolist()
-        height_errors = AttributeEvaluator.compute_height_error(
-            predicted_heights, true_heights
-        )
-        
-        predicted_tilts = [a.tilt_corrected_degrees for a in attributes]
-        true_tilts = ground_truth_tilts or np.random.uniform(-3, 3, len(predicted_tilts)).tolist()
-        tilt_errors = AttributeEvaluator.compute_tilt_error(
-            predicted_tilts, true_tilts
-        )
-        
+        height_errors = None
+        if ground_truth_heights:
+            predicted_heights = [a.height_meters for a in attributes if a.height_meters is not None]
+            height_errors = AttributeEvaluator.compute_height_error(
+                predicted_heights, ground_truth_heights
+            )
+
+        tilt_errors = None
+        if ground_truth_tilts:
+            predicted_tilts = [a.tilt_corrected_degrees for a in attributes]
+            tilt_errors = AttributeEvaluator.compute_tilt_error(
+                predicted_tilts, ground_truth_tilts
+            )
+
         # Generate report
         report = generate_evaluation_report(
             detection_metrics, height_errors, tilt_errors

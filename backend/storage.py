@@ -23,6 +23,7 @@ import os
 import json
 import shutil
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -38,6 +39,17 @@ from src.geometry_obb import (
     xyxy_to_obb_corners,
     order_corners_canonical,
 )
+
+
+def _safe_component(value: str) -> Optional[str]:
+    """
+    Reduce a user-supplied dataset_id/filename to a bare path segment,
+    rejecting anything that could escape the intended directory (path
+    separators, '..', or an empty value). Returns None if unsafe.
+    """
+    if not value or "/" in value or "\\" in value or value in (".", ".."):
+        return None
+    return value
 
 DEFAULT_DATA_DIR = os.environ.get("OBB_DATA_DIR", "data/datasets")
 VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -195,6 +207,20 @@ class DatasetManager:
     def __init__(self, base_dir: Union[str, Path] = DEFAULT_DATA_DIR):
         self.base_dir = Path(base_dir).resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        # Per-dataset locks serializing metadata.json read-modify-write cycles
+        # (batch worker and interactive requests can run concurrently against
+        # the same dataset from different threads).
+        self._metadata_locks: Dict[str, threading.RLock] = {}
+        self._metadata_locks_guard = threading.Lock()
+
+    def _lock_for(self, dataset_id: str) -> threading.RLock:
+        """Return the RLock guarding metadata.json read-modify-write for one dataset."""
+        with self._metadata_locks_guard:
+            lock = self._metadata_locks.get(dataset_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._metadata_locks[dataset_id] = lock
+            return lock
 
     def list_datasets(self) -> List[Dict[str, Any]]:
         """List all datasets available in base directory."""
@@ -246,17 +272,18 @@ class DatasetManager:
 
     def _update_metadata(self, dataset_id: str, metadata: Dict[str, Any]) -> None:
         metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
-        meta_file = self.base_dir / dataset_id / "metadata.json"
-        meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        ds_dir = self.base_dir / dataset_id
+        meta_file = ds_dir / "metadata.json"
+        # Write atomically (temp file + rename) so a crash mid-write can't
+        # leave metadata.json truncated/corrupt for the next reader.
+        tmp_file = ds_dir / f".metadata.json.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        os.replace(tmp_file, meta_file)
 
     def import_images(self, dataset_id: str, source_paths: List[Union[str, Path]]) -> List[str]:
         """
         Import image files into dataset images/ directory and update metadata.
         """
-        meta = self.get_dataset(dataset_id)
-        if not meta:
-            meta = self.create_dataset(dataset_id)
-
         ds_path = self.base_dir / dataset_id
         img_dir = ds_path / "images"
         imported: List[str] = []
@@ -278,32 +305,37 @@ class DatasetManager:
                     shutil.copy2(path_obj, target)
                 imported.append(path_obj.name)
 
-        # Refresh images in metadata
-        images_dict = meta.setdefault("images", {})
-        for name in imported:
-            if name not in images_dict:
-                stem = Path(name).stem
-                # Check if annotation already exists
-                ann_path = ds_path / "annotations" / f"{stem}.json"
-                pred_path = ds_path / "predictions" / f"{stem}.json"
-                status = "unlabeled"
-                if ann_path.exists():
-                    status = "verified"
-                elif pred_path.exists():
-                    status = "ai_suggested"
+        with self._lock_for(dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if not meta:
+                meta = self.create_dataset(dataset_id)
 
-                images_dict[name] = {
-                    "filename": name,
-                    "stem": stem,
-                    "status": status,
-                    "needs_review": False,
-                    "confidence": None,
-                    "annotation_count": 0,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
+            # Refresh images in metadata
+            images_dict = meta.setdefault("images", {})
+            for name in imported:
+                if name not in images_dict:
+                    stem = Path(name).stem
+                    # Check if annotation already exists
+                    ann_path = ds_path / "annotations" / f"{stem}.json"
+                    pred_path = ds_path / "predictions" / f"{stem}.json"
+                    status = "unlabeled"
+                    if ann_path.exists():
+                        status = "verified"
+                    elif pred_path.exists():
+                        status = "ai_suggested"
 
-        self._recount_stats(meta)
-        self._update_metadata(dataset_id, meta)
+                    images_dict[name] = {
+                        "filename": name,
+                        "stem": stem,
+                        "status": status,
+                        "needs_review": False,
+                        "confidence": None,
+                        "annotation_count": 0,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+
+            self._recount_stats(meta)
+            self._update_metadata(dataset_id, meta)
         return imported
 
     def _recount_stats(self, meta: Dict[str, Any]) -> None:
@@ -323,7 +355,20 @@ class DatasetManager:
         meta["needs_review_count"] = sum(1 for v in images.values() if v.get("needs_review"))
 
     def get_image_path(self, dataset_id: str, filename: str) -> Optional[Path]:
-        p = self.base_dir / dataset_id / "images" / filename
+        safe_id = _safe_component(dataset_id)
+        safe_name = _safe_component(filename)
+        if not safe_id or not safe_name:
+            return None
+        p = self.base_dir / safe_id / "images" / safe_name
+        return p if p.exists() else None
+
+    def get_cached_mask_file_path(self, dataset_id: str, mask_filename: str) -> Optional[Path]:
+        """Resolve a bare mask filename (from the mask-serving URL) to its file under masks/."""
+        safe_id = _safe_component(dataset_id)
+        safe_name = _safe_component(mask_filename)
+        if not safe_id or not safe_name:
+            return None
+        p = self.base_dir / safe_id / "masks" / safe_name
         return p if p.exists() else None
 
     def get_image_list(
@@ -366,17 +411,18 @@ class DatasetManager:
         pred_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
         # Update metadata to ai_suggested if currently unlabeled
-        meta = self.get_dataset(dataset_id)
-        if meta and filename in meta.get("images", {}):
-            entry = meta["images"][filename]
-            if entry.get("status") != "verified":
-                entry["status"] = "ai_suggested"
-            entry["needs_review"] = any(b.needs_review for b in boxes)
-            confs = [b.confidence for b in boxes]
-            entry["confidence"] = round(float(np.mean(confs)), 3) if confs else 0.0
-            entry["annotation_count"] = len(boxes)
-            self._recount_stats(meta)
-            self._update_metadata(dataset_id, meta)
+        with self._lock_for(dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if meta and filename in meta.get("images", {}):
+                entry = meta["images"][filename]
+                if entry.get("status") != "verified":
+                    entry["status"] = "ai_suggested"
+                entry["needs_review"] = any(b.needs_review for b in boxes)
+                confs = [b.confidence for b in boxes]
+                entry["confidence"] = round(float(np.mean(confs)), 3) if confs else 0.0
+                entry["annotation_count"] = len(boxes)
+                self._recount_stats(meta)
+                self._update_metadata(dataset_id, meta)
 
     def get_predictions(self, dataset_id: str, filename: str) -> Optional[Dict[str, Any]]:
         stem = Path(filename).stem
@@ -506,33 +552,34 @@ class DatasetManager:
             ann_txt.unlink()
 
         # 5. Update metadata status
-        meta = self.get_dataset(dataset_id)
-        if meta and filename in meta.get("images", {}):
-            entry = meta["images"][filename]
-            entry["status"] = target_status
-            entry["needs_review"] = False
-            entry["annotation_count"] = len(boxes) if target_status != "rejected" else 0
+        with self._lock_for(dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if meta and filename in meta.get("images", {}):
+                entry = meta["images"][filename]
+                entry["status"] = target_status
+                entry["needs_review"] = False
+                entry["annotation_count"] = len(boxes) if target_status != "rejected" else 0
 
-            # Store AL metadata
-            if al_categories is not None:
-                existing_cats = set(entry.get("al_categories", []))
-                existing_cats.update(al_categories)
-                entry["al_categories"] = sorted(list(existing_cats))
-            if failure_type is not None:
-                entry["failure_type"] = failure_type
-            if negative_category is not None:
-                entry["negative_category"] = negative_category
-            if is_negative:
-                entry["is_negative"] = True
-            if obb_correction_metrics is not None:
-                entry["obb_correction_metrics"] = obb_correction_metrics
+                # Store AL metadata
+                if al_categories is not None:
+                    existing_cats = set(entry.get("al_categories", []))
+                    existing_cats.update(al_categories)
+                    entry["al_categories"] = sorted(list(existing_cats))
+                if failure_type is not None:
+                    entry["failure_type"] = failure_type
+                if negative_category is not None:
+                    entry["negative_category"] = negative_category
+                if is_negative:
+                    entry["is_negative"] = True
+                if obb_correction_metrics is not None:
+                    entry["obb_correction_metrics"] = obb_correction_metrics
 
-            if diff_record and "difficulty" in diff_record:
-                entry["difficulty_score"] = diff_record["difficulty"].get("score", 0.1)
-                entry["difficulty_reasons"] = diff_record["difficulty"].get("reasons", [])
-            entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-            self._recount_stats(meta)
-            self._update_metadata(dataset_id, meta)
+                if diff_record and "difficulty" in diff_record:
+                    entry["difficulty_score"] = diff_record["difficulty"].get("score", 0.1)
+                    entry["difficulty_reasons"] = diff_record["difficulty"].get("reasons", [])
+                entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._recount_stats(meta)
+                self._update_metadata(dataset_id, meta)
 
         return record
 
@@ -711,30 +758,31 @@ class DatasetManager:
 
     def compute_dataset_phashes(self, dataset_id: str) -> Dict[str, str]:
         """Compute or retrieve perceptual hash (pHash) for all images in dataset."""
-        meta = self.get_dataset(dataset_id)
-        if not meta:
-            return {}
-        images_dict = meta.get("images", {})
-        ds_img_dir = self.base_dir / dataset_id / "images"
-        hashes = {}
-        updated = False
+        with self._lock_for(dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if not meta:
+                return {}
+            images_dict = meta.get("images", {})
+            ds_img_dir = self.base_dir / dataset_id / "images"
+            hashes = {}
+            updated = False
 
-        for filename, entry in images_dict.items():
-            h = entry.get("phash")
-            if not h:
-                img_p = ds_img_dir / filename
-                if img_p.exists():
-                    h = compute_phash(img_p)
-                    if h:
-                        entry["phash"] = h
-                        updated = True
-            if h:
-                hashes[filename] = h
+            for filename, entry in images_dict.items():
+                h = entry.get("phash")
+                if not h:
+                    img_p = ds_img_dir / filename
+                    if img_p.exists():
+                        h = compute_phash(img_p)
+                        if h:
+                            entry["phash"] = h
+                            updated = True
+                if h:
+                    hashes[filename] = h
 
-        if updated:
-            self._update_metadata(dataset_id, meta)
+            if updated:
+                self._update_metadata(dataset_id, meta)
 
-        return hashes
+            return hashes
 
     def find_near_duplicates(
         self,
@@ -747,44 +795,46 @@ class DatasetManager:
         """
         cfg = self._load_al_weights()
         thresh = threshold if threshold is not None else cfg.get("duplicate_phash_threshold", 8)
-        hashes = self.compute_dataset_phashes(dataset_id)
-        filenames = list(hashes.keys())
-        meta = self.get_dataset(dataset_id)
-        if not meta:
-            return []
 
-        images_dict = meta.get("images", {})
-        duplicates = []
-        flagged_as_duplicate = set()
+        with self._lock_for(dataset_id):
+            hashes = self.compute_dataset_phashes(dataset_id)
+            filenames = list(hashes.keys())
+            meta = self.get_dataset(dataset_id)
+            if not meta:
+                return []
 
-        for i in range(len(filenames)):
-            f1 = filenames[i]
-            h1 = hashes[f1]
-            for j in range(i + 1, len(filenames)):
-                f2 = filenames[j]
-                h2 = hashes[f2]
-                dist = hamming_distance(h1, h2)
-                if dist <= thresh:
-                    duplicates.append({
-                        "primary": f1,
-                        "duplicate": f2,
-                        "distance": dist,
-                    })
-                    flagged_as_duplicate.add(f2)
-                    if f2 in images_dict:
-                        images_dict[f2]["is_duplicate"] = True
-                        images_dict[f2]["duplicate_of"] = f1
-                        images_dict[f2]["duplicate_distance"] = dist
+            images_dict = meta.get("images", {})
+            duplicates = []
+            flagged_as_duplicate = set()
 
-        # Reset flag for non-duplicates
-        for fn, entry in images_dict.items():
-            if fn not in flagged_as_duplicate and entry.get("is_duplicate"):
-                entry["is_duplicate"] = False
-                entry.pop("duplicate_of", None)
-                entry.pop("duplicate_distance", None)
+            for i in range(len(filenames)):
+                f1 = filenames[i]
+                h1 = hashes[f1]
+                for j in range(i + 1, len(filenames)):
+                    f2 = filenames[j]
+                    h2 = hashes[f2]
+                    dist = hamming_distance(h1, h2)
+                    if dist <= thresh:
+                        duplicates.append({
+                            "primary": f1,
+                            "duplicate": f2,
+                            "distance": dist,
+                        })
+                        flagged_as_duplicate.add(f2)
+                        if f2 in images_dict:
+                            images_dict[f2]["is_duplicate"] = True
+                            images_dict[f2]["duplicate_of"] = f1
+                            images_dict[f2]["duplicate_distance"] = dist
 
-        self._update_metadata(dataset_id, meta)
-        return duplicates
+            # Reset flag for non-duplicates
+            for fn, entry in images_dict.items():
+                if fn not in flagged_as_duplicate and entry.get("is_duplicate"):
+                    entry["is_duplicate"] = False
+                    entry.pop("duplicate_of", None)
+                    entry.pop("duplicate_distance", None)
+
+            self._update_metadata(dataset_id, meta)
+            return duplicates
 
     def reject_with_metadata(
         self,
@@ -853,14 +903,15 @@ class DatasetManager:
 
     def toggle_test_set(self, dataset_id: str, filename: str) -> bool:
         """Toggle test set status for an image. Isolated from active learning exports."""
-        meta = self.get_dataset(dataset_id)
-        if not meta or filename not in meta.get("images", {}):
-            raise ValueError(f"Image {filename} not found in dataset {dataset_id}")
-        entry = meta["images"][filename]
-        current = entry.get("is_test_set", False)
-        entry["is_test_set"] = not current
-        self._update_metadata(dataset_id, meta)
-        return entry["is_test_set"]
+        with self._lock_for(dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if not meta or filename not in meta.get("images", {}):
+                raise ValueError(f"Image {filename} not found in dataset {dataset_id}")
+            entry = meta["images"][filename]
+            current = entry.get("is_test_set", False)
+            entry["is_test_set"] = not current
+            self._update_metadata(dataset_id, meta)
+            return entry["is_test_set"]
 
     def get_test_set(self, dataset_id: str) -> List[Dict[str, Any]]:
         """Return list of images marked as belonging to the fixed test set."""
