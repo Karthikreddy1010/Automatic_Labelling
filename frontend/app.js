@@ -11,6 +11,23 @@
  * - Comprehensive Keyboard Shortcuts
  */
 
+// Base URL for all backend calls, derived from this script's own resolved
+// URL rather than hardcoded as "/". Works identically whether the app is
+// served at the domain root or behind a reverse-proxy sub-path (JupyterHub's
+// /proxy/, VS Code Server's /vscode/proxy/, etc.) with no environment-specific
+// configuration -- a hardcoded "/api/..." path breaks under any such prefix
+// because the browser resolves it against the domain root, not the proxy path.
+const API_BASE = document.currentScript
+  ? new URL('.', document.currentScript.src).href
+  : window.location.origin + '/';
+
+// Bumped every time selectImage() targets a new image. Async handlers
+// (image load, annotation/prediction fetches, AI inference, SAM refine)
+// capture it before their await and re-check it after, so a response that
+// arrives after the user has navigated away is discarded instead of being
+// applied to whatever image is now active.
+let activeLoadToken = 0;
+
 // --- STATE DEFINITIONS ---
 const state = {
   datasets: [],
@@ -39,9 +56,15 @@ const state = {
   
   filterStatus: 'all',
   layerVisibility: { yolo: true, dino: true, sam: true },
-  
+  labelFilter: 'all',   // 'all' | 'accept' | 'review' | 'reject' | 'disagreement' | 'geometry_warning' -- filters the per-image Labels list only
+
   batchPollInterval: null,
   activeDevice: 'AUTO',
+
+  // Client-side undo/redo: snapshots of state.boxes, reset per-image.
+  history: [],
+  historyIndex: -1,
+  isDirty: false,
 };
 
 // --- DOM ELEMENTS ---
@@ -76,6 +99,8 @@ const elements = {
   btnZoomOut: document.getElementById('btn-zoom-out'),
   btnZoomFit: document.getElementById('btn-zoom-fit'),
   zoomText: document.getElementById('zoom-level-text'),
+  btnUndo: document.getElementById('btn-undo'),
+  btnRedo: document.getElementById('btn-redo'),
   
   toggleYolo: document.getElementById('toggle-yolo'),
   toggleDino: document.getElementById('toggle-dino'),
@@ -84,15 +109,39 @@ const elements = {
   btnPrevImg: document.getElementById('btn-prev-img'),
   btnNextImg: document.getElementById('btn-next-img'),
   paginationText: document.getElementById('image-pagination-text'),
+  imageStatusBadge: document.getElementById('image-status-badge'),
+  unsavedIndicator: document.getElementById('unsaved-indicator'),
   btnAcceptVerify: document.getElementById('btn-accept-verify'),
   btnAccept: document.getElementById('btn-accept'),
   btnReject: document.getElementById('btn-reject'),
+  btnRemoveAllLabels: document.getElementById('btn-remove-all-labels'),
   btnNextDifficult: document.getElementById('btn-next-difficult'),
-  
+
+  // Labels List
+  labelsCountBadge: document.getElementById('labels-count-badge'),
+  labelsList: document.getElementById('labels-list'),
+  labelsFilterChips: document.getElementById('labels-filter-chips'),
+
   // Provenance Elements
   provPipeline: document.getElementById('prov-pipeline'),
   provQwen: document.getElementById('prov-qwen'),
+  provQwenMaterialRow: document.getElementById('prov-qwen-material-row'),
+  provQwenMaterialVal: document.getElementById('prov-qwen-material-val'),
+  provQwenVisibilityRow: document.getElementById('prov-qwen-visibility-row'),
+  provQwenVisibilityVal: document.getElementById('prov-qwen-visibility-val'),
+  provDecisionRow: document.getElementById('prov-decision-row'),
+  provDecisionBadge: document.getElementById('prov-decision-badge'),
+  provFinalScoreRow: document.getElementById('prov-final-score-row'),
+  provFinalScoreVal: document.getElementById('prov-final-score-val'),
+  provGeometryRow: document.getElementById('prov-geometry-row'),
+  provGeometryVal: document.getElementById('prov-geometry-val'),
+  provSegmentationRow: document.getElementById('prov-segmentation-row'),
+  provSegmentationVal: document.getElementById('prov-segmentation-val'),
+  provDisagreementRow: document.getElementById('prov-disagreement-row'),
+  provDisagreementVal: document.getElementById('prov-disagreement-val'),
   provHumanStatus: document.getElementById('prov-human-status'),
+  provQualityRow: document.getElementById('prov-quality-row'),
+  provQualityVal: document.getElementById('prov-quality-val'),
   provIouRow: document.getElementById('prov-iou-row'),
   provIouVal: document.getElementById('prov-iou-val'),
   provPriorityRow: document.getElementById('prov-priority-row'),
@@ -158,6 +207,8 @@ const elements = {
   batchModeSelect: document.getElementById('batch-mode-select'),
   batchUnlabeledOnly: document.getElementById('batch-unlabeled-only'),
   batchSamRefine: document.getElementById('batch-sam-refine'),
+  batchGeometryQa: document.getElementById('batch-geometry-qa'),
+  batchQwenGating: document.getElementById('batch-qwen-gating'),
   batchProgressFill: document.getElementById('batch-progress-fill'),
   batchStatusVal: document.getElementById('batch-status-val'),
   batchProgressVal: document.getElementById('batch-progress-val'),
@@ -232,6 +283,17 @@ function orderCornersCanonical(pts) {
   return out;
 }
 
+// Enclosing axis-aligned box for a set of corners. box.xyxy must be kept in
+// sync with box.corners any time corners are mutated after creation (moved,
+// resized, rotated, corner-dragged, or replaced by a SAM refine) -- a few
+// features (e.g. "Refine with SAM") read box.xyxy directly, and a stale
+// value would re-segment the box's original position instead of its current one.
+function cornersToXyxy(corners) {
+  const xs = corners.map(p => p[0]);
+  const ys = corners.map(p => p[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
 function computeTiltAngle(corners) {
   if (!corners || corners.length < 4) return 0.0;
   // Vector from bottom center to top center
@@ -261,7 +323,7 @@ async function init() {
 
 async function fetchHardware() {
   try {
-    const res = await fetch('/api/system/hardware');
+    const res = await fetch(API_BASE + 'api/system/hardware');
     const data = await res.json();
     state.activeDevice = data.active_device_setting;
     elements.deviceSelect.value = state.activeDevice;
@@ -273,7 +335,7 @@ async function fetchHardware() {
 
 async function fetchModelStatus() {
   try {
-    const res = await fetch('/api/models/status');
+    const res = await fetch(API_BASE + 'api/models/status');
     const data = await res.json();
     elements.modelStatusList.innerHTML = '';
     data.models.forEach(m => {
@@ -307,7 +369,7 @@ async function fetchModelStatus() {
         badge.addEventListener('click', async () => {
           badge.textContent = 'loading...';
           try {
-            await fetch(`/api/models/load?model_id=${encodeURIComponent(m.id)}`, { method: 'POST' });
+            await fetch(API_BASE + `api/models/load?model_id=${encodeURIComponent(m.id)}`, { method: 'POST' });
             await fetchModelStatus();
           } catch (e) {
             badge.textContent = 'error';
@@ -324,8 +386,7 @@ async function fetchModelStatus() {
 
 async function loadDatasets() {
   try {
-    const res = await fetch('/api/datasets');
-    const data = await res.json();
+    const data = await fetchJson(API_BASE + 'api/datasets');
     state.datasets = data.datasets || [];
     
     elements.datasetSelect.innerHTML = '';
@@ -347,12 +408,13 @@ async function loadDatasets() {
     await loadDatasetImages(state.activeDatasetId);
   } catch (err) {
     console.error('Failed to load datasets:', err);
+    elements.paginationText.textContent = `Failed to load datasets: ${err.message}`;
   }
 }
 
 async function createNewDataset(id, name) {
   try {
-    const res = await fetch('/api/datasets', {
+    const res = await fetch(API_BASE + 'api/datasets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ dataset_id: id, name: name, classes: ['utility_pole'] })
@@ -367,13 +429,11 @@ async function createNewDataset(id, name) {
 async function loadDatasetImages(datasetId) {
   try {
     const filterParam = state.filterStatus === 'all' ? '' : `?status=${state.filterStatus}`;
-    const res = await fetch(`/api/datasets/${datasetId}/images${filterParam}`);
-    const data = await res.json();
+    const data = await fetchJson(API_BASE + `api/datasets/${datasetId}/images${filterParam}`);
     state.images = data.images || [];
-    
+
     // Update count badge & stats
-    const dsMetaRes = await fetch(`/api/datasets/${datasetId}`);
-    const dsData = await dsMetaRes.json();
+    const dsData = await fetchJson(API_BASE + `api/datasets/${datasetId}`);
     const meta = dsData.dataset;
     elements.imageCountBadge.textContent = meta.image_count;
     elements.statVerified.textContent = meta.verified_count;
@@ -398,6 +458,7 @@ async function loadDatasetImages(datasetId) {
     }
   } catch (err) {
     console.error('Failed to load images:', err);
+    elements.paginationText.textContent = `Failed to load images: ${err.message}`;
   }
 }
 
@@ -432,36 +493,44 @@ function renderGallery() {
 
 async function selectImage(index) {
   if (index < 0 || index >= state.images.length) return;
+  if (state.isDirty) {
+    const proceed = confirm('You have unsaved changes on this image. Leave without saving?');
+    if (!proceed) return;
+  }
+  const token = ++activeLoadToken;
   state.activeImageIndex = index;
   state.activeImageMeta = state.images[index];
   state.selectedBoxIndex = -1;
   updateSelectionInspector();
   updateTestSetUI(!!state.activeImageMeta.is_test_set);
+  updateImageStatusBadge();
   setPositiveTags(state.activeImageMeta.al_categories || []);
   renderGallery();
-  
+
   elements.paginationText.textContent = `${index + 1} / ${state.images.length} — ${state.activeImageMeta.filename}`;
-  
+
   showSpinner('Loading image & labels...');
-  
+
   // 1. Load image onto HTML Image element
-  const imgUrl = `/api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}`;
+  const imgUrl = `${API_BASE}api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}`;
   const img = new Image();
   img.crossOrigin = 'anonymous';
   img.src = imgUrl;
-  await new Promise((resolve, reject) => {
-    img.onload = () => { state.imageObj = img; resolve(); };
-    img.onerror = () => { console.error('Error loading image'); resolve(); };
+  const loadOk = await new Promise((resolve) => {
+    img.onload = () => resolve(true);
+    img.onerror = () => { console.error('Error loading image:', imgUrl); resolve(false); };
   });
-  
+  if (token !== activeLoadToken) return; // superseded by a newer selectImage() call
+  state.imageObj = loadOk ? img : null;
+  state.imageLoadFailed = !loadOk;
+
   // 2. Fetch existing annotations or predictions
+  let loadedBoxes = [];
   try {
-    const annRes = await fetch(`/api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`);
-    const annData = await annRes.json();
-    
-    state.boxes = [];
+    const annData = await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`);
+
     if (annData.data && annData.data.boxes) {
-      state.boxes = annData.data.boxes.map(b => {
+      loadedBoxes = annData.data.boxes.map(b => {
         let corners = b.corners;
         if (!corners && b.xyxy) {
           const [x1, y1, x2, y2] = b.xyxy;
@@ -476,17 +545,23 @@ async function selectImage(index) {
   } catch (err) {
     console.error('Failed to load annotations:', err);
   }
-  
+  if (token !== activeLoadToken) return; // superseded by a newer selectImage() call
+  state.boxes = loadedBoxes;
+  initHistory();
+  setDirty(false);
+  renderLabelList();
+
   // 3. Fetch differential history for this image
   await fetchDifferentialHistory(state.activeImageMeta.filename);
-  
+  if (token !== activeLoadToken) return; // superseded by a newer selectImage() call
+
   hideSpinner();
   zoomFit();
 }
 
 async function fetchDifferentialHistory(filename) {
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/history?filename=${encodeURIComponent(filename)}`);
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/history?filename=${encodeURIComponent(filename)}`);
     const data = await res.json();
     if (data.history && data.history.length > 0) {
       const h = data.history[0];
@@ -538,9 +613,21 @@ function render() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
   ctx.restore();
-  
-  if (!state.imageObj) return;
-  
+
+  if (!state.imageObj) {
+    // Never leave the canvas silently black/blank -- tell the user why.
+    ctx.save();
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    const msg = state.imageLoadFailed
+      ? 'Failed to load this image (check the file exists and the API/proxy connection).'
+      : 'No image loaded.';
+    ctx.fillText(msg, rect.width / 2, rect.height / 2);
+    ctx.restore();
+    return;
+  }
+
   ctx.save();
   // Apply Zoom & Pan
   ctx.translate(state.transform.tx, state.transform.ty);
@@ -577,10 +664,17 @@ function drawOBB(box, isSelected, isHovered) {
   // Determine Color Scheme based on Review / Source / Confidence
   let strokeColor = '#58a6ff'; // Blue for human
   let fillColor = 'rgba(88, 166, 255, 0.2)';
-  
+  const decision = box.attributes && box.attributes.decision; // 'ACCEPT'|'REVIEW'|'REJECT' from decision_engine.py, when this box went through it
+
   if (box.model_source !== 'HUMAN') {
-    if (box.needs_review || box.confidence < 0.45) {
-      strokeColor = '#f85149'; // Red (review / low conf)
+    if (decision === 'ACCEPT') {
+      strokeColor = '#2ea043'; fillColor = 'rgba(46, 160, 67, 0.2)';
+    } else if (decision === 'REJECT') {
+      strokeColor = '#f85149'; fillColor = 'rgba(248, 81, 73, 0.2)';
+    } else if (decision === 'REVIEW') {
+      strokeColor = '#d29922'; fillColor = 'rgba(210, 153, 34, 0.2)';
+    } else if (box.needs_review || box.confidence < 0.45) {
+      strokeColor = '#f85149'; // Red (review / low conf) -- no decision engine output (e.g. YOLO_FAST/RUN_ALL)
       fillColor = 'rgba(248, 81, 73, 0.2)';
     } else if (box.confidence < 0.70 || box.model_source === 'DINO') {
       strokeColor = '#d29922'; // Yellow (medium)
@@ -592,8 +686,8 @@ function drawOBB(box, isSelected, isHovered) {
   }
   
   if (isSelected) {
-    strokeColor = '#39c5bb'; // Cyan highlight for selected
-    fillColor = 'rgba(57, 197, 187, 0.25)';
+    strokeColor = '#8b5cf6'; // Accent purple highlight for selected (matches CSS --color-accent)
+    fillColor = 'rgba(139, 92, 246, 0.25)';
   }
   
   // Draw Polygon Path (Clockwise: 0 -> 1 -> 2 -> 3 -> 0)
@@ -657,12 +751,12 @@ function drawOBB(box, isSelected, isHovered) {
     ctx.beginPath();
     ctx.moveTo(topCx, topCy);
     ctx.lineTo(rotX, rotY);
-    ctx.strokeStyle = '#39c5bb';
+    ctx.strokeStyle = '#8b5cf6';
     ctx.stroke();
-    
+
     ctx.beginPath();
     ctx.arc(rotX, rotY, handleRadius * 1.1, 0, Math.PI * 2);
-    ctx.fillStyle = '#39c5bb';
+    ctx.fillStyle = '#8b5cf6';
     ctx.fill();
     ctx.strokeStyle = '#fff';
     ctx.stroke();
@@ -673,7 +767,15 @@ function drawOBB(box, isSelected, isHovered) {
   const badgeY = corners[0][1] - 8 / state.transform.scale;
   ctx.font = `${Math.max(10, 11 / state.transform.scale)}px ${getComputedStyle(document.body).fontFamily}`;
   const confText = box.confidence ? `${Math.round(box.confidence * 100)}%` : '';
-  const labelStr = `${box.class_name || 'utility_pole'} [${box.model_source || 'AI'}] ${confText}`;
+  const className = box.class_name || 'utility_pole';
+  let labelStr;
+  if (box.model_source === 'HUMAN') {
+    labelStr = `${className} · Human`;
+  } else if (decision) {
+    labelStr = `${className} · ${decision} ${confText}`;
+  } else {
+    labelStr = `${className} · ${confText}`;
+  }
   const textW = ctx.measureText(labelStr).width;
   
   ctx.fillStyle = 'rgba(18, 23, 31, 0.85)';
@@ -690,9 +792,9 @@ function drawInteractiveRect(start, current) {
   
   ctx.beginPath();
   ctx.rect(minX, minY, maxX - minX, maxY - minY);
-  ctx.strokeStyle = '#39c5bb';
+  ctx.strokeStyle = '#8b5cf6';
   ctx.lineWidth = 1.5 / state.transform.scale;
-  ctx.fillStyle = 'rgba(57, 197, 187, 0.15)';
+  ctx.fillStyle = 'rgba(139, 92, 246, 0.15)';
   ctx.fill();
   ctx.stroke();
 }
@@ -818,7 +920,19 @@ function setupEventListeners() {
   // Inspector
   elements.btnInspectRefineSam.addEventListener('click', refineSelectedWithSAM);
   elements.btnInspectDelete.addEventListener('click', deleteSelectedBox);
-  
+
+  // Undo/Redo & Remove All Labels
+  if (elements.btnUndo) elements.btnUndo.addEventListener('click', undo);
+  if (elements.btnRedo) elements.btnRedo.addEventListener('click', redo);
+  if (elements.btnRemoveAllLabels) elements.btnRemoveAllLabels.addEventListener('click', removeAllLabelsCurrentImage);
+
+  // Labels list filter chips (accept/review/reject/disagreement/geometry warning)
+  if (elements.labelsFilterChips) {
+    elements.labelsFilterChips.querySelectorAll('.filter-chip').forEach(chip => {
+      chip.addEventListener('click', () => setLabelFilter(chip.dataset.filter));
+    });
+  }
+
   // Filter pills
   document.querySelectorAll('.filter-pill').forEach(pill => {
     pill.addEventListener('click', () => {
@@ -837,7 +951,7 @@ function setupEventListeners() {
   
   // Device change
   elements.deviceSelect.addEventListener('change', async (e) => {
-    await fetch('/api/system/device', {
+    await fetch(API_BASE + 'api/system/device', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ device: e.target.value })
@@ -849,9 +963,9 @@ function setupEventListeners() {
   elements.btnBatchModal.addEventListener('click', () => elements.batchModal.classList.remove('hidden'));
   elements.btnCloseBatchModal.addEventListener('click', () => elements.batchModal.classList.add('hidden'));
   elements.btnStartBatch.addEventListener('click', startBatchJob);
-  elements.btnPauseBatch.addEventListener('click', () => fetch('/api/batch/pause', { method: 'POST' }));
-  elements.btnResumeBatch.addEventListener('click', () => fetch('/api/batch/resume', { method: 'POST' }));
-  elements.btnCancelBatch.addEventListener('click', () => fetch('/api/batch/cancel', { method: 'POST' }));
+  elements.btnPauseBatch.addEventListener('click', () => fetch(API_BASE + 'api/batch/pause', { method: 'POST' }));
+  elements.btnResumeBatch.addEventListener('click', () => fetch(API_BASE + 'api/batch/resume', { method: 'POST' }));
+  elements.btnCancelBatch.addEventListener('click', () => fetch(API_BASE + 'api/batch/cancel', { method: 'POST' }));
   
   elements.btnImportImages.addEventListener('click', () => elements.importModal.classList.remove('hidden'));
   elements.btnCloseImportModal.addEventListener('click', () => elements.importModal.classList.add('hidden'));
@@ -863,6 +977,14 @@ function setupEventListeners() {
   
   // Keyboard Shortcuts
   window.addEventListener('keydown', handleKeyDown);
+
+  // Warn before closing/reloading the tab with unsaved edits.
+  window.addEventListener('beforeunload', (e) => {
+    if (state.isDirty) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
 }
 
 function setToolMode(mode) {
@@ -1053,19 +1175,23 @@ function handleMouseUp(e) {
       state.boxes.push(newBox);
       state.selectedBoxIndex = state.boxes.length - 1;
       setToolMode('select');
+      pushHistory();
       updateSelectionInspector();
     }
     state.isDrawing = false;
     state.drawStart = null;
     render();
   }
-  
+
   if (state.isDraggingHandle && state.dragTarget) {
     // Canonicalize corners on drag release
     const box = state.dragTarget.box;
+    const moved = JSON.stringify(box.corners) !== JSON.stringify(state.dragTarget.origCorners);
     box.corners = orderCornersCanonical(box.corners);
+    box.xyxy = cornersToXyxy(box.corners);
     state.isDraggingHandle = false;
     state.dragTarget = null;
+    if (moved) pushHistory(); // one undo step per drag, not per mousemove; skip no-op clicks
     updateSelectionInspector();
     render();
   }
@@ -1079,9 +1205,10 @@ function updateSelectionInspector() {
     elements.selectionDetails.classList.add('hidden');
     elements.selectionStatusBadge.textContent = 'None';
     elements.selectionStatusBadge.className = 'badge';
+    renderLabelList();
     return;
   }
-  
+
   elements.selectionEmptyState.classList.add('hidden');
   elements.selectionDetails.classList.remove('hidden');
   
@@ -1119,50 +1246,131 @@ function updateSelectionInspector() {
   }
   
   // --- Provenance & Evidence Card ---
-  // Pipeline source chain
+  // Pipeline source chain -- built from what actually ran for THIS candidate
+  // (box.attributes), not just guessed from the model_source string, so it
+  // stays accurate as the pipeline gains/loses stages.
   const srcLower = src.toLowerCase();
   let pipelineText = src;
   if (srcLower.includes('dino') && srcLower.includes('sam')) {
-    pipelineText = 'Grounding DINO → SAM 2.1 → OBB';
+    const stages = ['Grounding DINO', 'SAM3', 'SAM refine'];
+    if (box.attributes && box.attributes.geometry_status) stages.push('Geometry QA');
+    stages.push(box.attributes && box.attributes.qwen_ran ? 'Qwen' : 'Qwen (skipped)');
+    stages.push('Decision');
+    pipelineText = stages.join(' → ');
   } else if (srcLower.includes('dino')) {
     pipelineText = 'Grounding DINO → OBB';
   } else if (srcLower.includes('sam')) {
-    pipelineText = 'SAM 2.1 → OBB';
+    pipelineText = 'SAM → OBB';
   } else if (srcLower.includes('yolo')) {
     pipelineText = 'YOLO-OBB';
   } else if (srcLower === 'human') {
     pipelineText = 'Human Annotation';
   }
   elements.provPipeline.textContent = pipelineText;
-  
-  // Qwen verifier status (from box attributes if available)
-  if (box.attributes && box.attributes.qwen_verdict) {
-    elements.provQwen.textContent = box.attributes.qwen_verdict;
-    elements.provQwen.className = 'prov-v green';
+
+  const attrs = box.attributes || {};
+
+  // Decision badge (ACCEPT/REVIEW/REJECT from the multi-signal decision engine).
+  // A human can always override this via edit/Accept/Reject -- it's advisory,
+  // not a lock.
+  if (attrs.decision) {
+    elements.provDecisionRow.classList.remove('hidden');
+    elements.provDecisionBadge.textContent = attrs.decision;
+    elements.provDecisionBadge.className = 'badge ' + (
+      attrs.decision === 'ACCEPT' ? 'badge-success' : attrs.decision === 'REJECT' ? 'badge-danger' : 'badge-warning'
+    );
   } else {
-    elements.provQwen.textContent = 'UNAVAILABLE';
+    elements.provDecisionRow.classList.add('hidden');
+  }
+
+  if (typeof attrs.final_score === 'number') {
+    elements.provFinalScoreRow.classList.remove('hidden');
+    elements.provFinalScoreVal.textContent = attrs.final_score.toFixed(2);
+  } else {
+    elements.provFinalScoreRow.classList.add('hidden');
+  }
+
+  // Qwen semantic verification (from box attributes if it ran for this candidate)
+  if (attrs.qwen_ran && attrs.qwen_class) {
+    const conf = typeof attrs.qwen_semantic_confidence === 'number' ? ` (${attrs.qwen_semantic_confidence.toFixed(2)})` : '';
+    elements.provQwen.textContent = `${attrs.qwen_class.replace(/_/g, ' ')}${conf}`;
+    elements.provQwen.className = 'prov-v ' + (attrs.qwen_class === 'electric_utility_pole' ? 'green' : 'red');
+  } else {
+    elements.provQwen.textContent = 'Not run';
     elements.provQwen.className = 'prov-v yellow';
   }
-  
+  if (attrs.qwen_ran && attrs.qwen_material) {
+    elements.provQwenMaterialRow.classList.remove('hidden');
+    elements.provQwenMaterialVal.textContent = attrs.qwen_material;
+  } else {
+    elements.provQwenMaterialRow.classList.add('hidden');
+  }
+  if (attrs.qwen_ran && attrs.qwen_visibility) {
+    elements.provQwenVisibilityRow.classList.remove('hidden');
+    elements.provQwenVisibilityVal.textContent = attrs.qwen_visibility.replace(/_/g, ' ');
+  } else {
+    elements.provQwenVisibilityRow.classList.add('hidden');
+  }
+
+  // Geometry QA (geometry_qa.py) -- score + status, not just a pass/fail flag.
+  if (attrs.geometry_status) {
+    elements.provGeometryRow.classList.remove('hidden');
+    const gScore = typeof attrs.geometry_score === 'number' ? attrs.geometry_score.toFixed(2) : '--';
+    elements.provGeometryVal.textContent = `${attrs.geometry_status} (${gScore})`;
+    elements.provGeometryVal.className = 'prov-v ' + (
+      attrs.geometry_status === 'pass' ? 'green' : attrs.geometry_status === 'fail' ? 'red' : 'yellow'
+    );
+    elements.provGeometryVal.title = (attrs.geometry_flags || []).join('; ');
+  } else {
+    elements.provGeometryRow.classList.add('hidden');
+  }
+
+  if (typeof attrs.segmentation_score === 'number') {
+    elements.provSegmentationRow.classList.remove('hidden');
+    elements.provSegmentationVal.textContent = attrs.segmentation_score.toFixed(2);
+  } else {
+    elements.provSegmentationRow.classList.add('hidden');
+  }
+
+  // Disagreement between independent signals (DINO vs Qwen, Qwen vs SAM, etc.)
+  if (attrs.disagreements && attrs.disagreements.length > 0) {
+    elements.provDisagreementRow.classList.remove('hidden');
+    elements.provDisagreementVal.textContent = attrs.disagreements.join('; ');
+  } else {
+    elements.provDisagreementRow.classList.add('hidden');
+  }
+
   // Human review status
   const imgStatus = state.activeImageMeta ? (state.activeImageMeta.status || 'unlabeled') : 'unlabeled';
   elements.provHumanStatus.textContent = imgStatus.replace('_', ' ');
   elements.provHumanStatus.className = `prov-v ${imgStatus === 'accepted' || imgStatus === 'verified' ? 'green' : imgStatus === 'rejected' ? 'red' : 'yellow'}`;
   
+  // Quality score (heuristic signal from the DINO+SAM pipeline, NOT a
+  // calibrated probability -- labeled and treated as such).
+  if (box.attributes && typeof box.attributes.quality_score === 'number') {
+    elements.provQualityRow.classList.remove('hidden');
+    const q = box.attributes.quality_score;
+    const cat = box.attributes.category || '';
+    elements.provQualityVal.textContent = `${q.toFixed(2)}${cat ? ' (' + cat.replace('_', ' ') + ')' : ''}`;
+    elements.provQualityVal.className = `prov-v ${cat === 'HIGH_QUALITY' ? 'green' : cat === 'REJECT' ? 'red' : 'yellow'}`;
+  } else {
+    elements.provQualityRow.classList.add('hidden');
+  }
+
   // Correction IoU (from box attributes if available)
   if (box.attributes && box.attributes.correction_iou !== undefined) {
     elements.provIouRow.classList.remove('hidden');
     const iou = (box.attributes.correction_iou * 100).toFixed(1);
     elements.provIouVal.textContent = `${iou}%`;
   } else {
-    elements.provIouRow.style.display = '';
+    elements.provIouRow.classList.add('hidden');
     elements.provIouVal.textContent = '--';
   }
-  
+
   // Active Learning priority (from image meta)
   if (state.activeImageMeta && state.activeImageMeta.priority !== undefined) {
     const priority = state.activeImageMeta.priority;
-    elements.provPriorityRow.style.display = '';
+    elements.provPriorityRow.classList.remove('hidden');
     if (priority >= 70) {
       elements.provPriorityBadge.textContent = `HIGH (${priority})`;
       elements.provPriorityBadge.className = 'badge badge-danger';
@@ -1177,26 +1385,297 @@ function updateSelectionInspector() {
     elements.provPriorityBadge.textContent = 'NORMAL';
     elements.provPriorityBadge.className = 'badge';
   }
+
+  renderLabelList();
 }
 
 function deleteSelectedBox() {
   if (state.selectedBoxIndex < 0 || state.selectedBoxIndex >= state.boxes.length) return;
   state.boxes.splice(state.selectedBoxIndex, 1);
   state.selectedBoxIndex = -1;
+  pushHistory();
   updateSelectionInspector();
   render();
+}
+
+function removeAllLabelsCurrentImage() {
+  if (!state.activeImageMeta) return;
+  if (state.boxes.length === 0) return;
+  const confirmed = confirm(
+    'Remove all labels from this image?\n\n' +
+    'This will remove all labels from the current image only. ' +
+    'Click "Save Edits" afterward to persist this change.'
+  );
+  if (!confirmed) return;
+  state.boxes = [];
+  state.selectedBoxIndex = -1;
+  pushHistory();
+  updateSelectionInspector();
+  render();
+}
+
+// --- UNDO / REDO & UNSAVED-CHANGES TRACKING ---
+// Client-side snapshot history of state.boxes, reset per image. Every
+// committed edit (add/delete/move/resize/rotate/corner-drag/clear-all) pushes
+// one snapshot; continuous drag operations only push once, on mouseup, so a
+// single drag is a single undo step.
+
+function cloneBoxes(boxes) {
+  return JSON.parse(JSON.stringify(boxes || []));
+}
+
+function initHistory() {
+  state.history = [cloneBoxes(state.boxes)];
+  state.historyIndex = 0;
+  updateUndoRedoButtons();
+}
+
+function pushHistory() {
+  state.history = state.history.slice(0, state.historyIndex + 1);
+  state.history.push(cloneBoxes(state.boxes));
+  state.historyIndex = state.history.length - 1;
+  const MAX_HISTORY = 100;
+  if (state.history.length > MAX_HISTORY) {
+    state.history.shift();
+    state.historyIndex--;
+  }
+  updateUndoRedoButtons();
+  setDirty(true);
+}
+
+function undo() {
+  if (state.historyIndex <= 0) return;
+  state.historyIndex--;
+  state.boxes = cloneBoxes(state.history[state.historyIndex]);
+  state.selectedBoxIndex = -1;
+  updateUndoRedoButtons();
+  updateSelectionInspector();
+  render();
+  setDirty(state.historyIndex !== 0);
+}
+
+function redo() {
+  if (state.historyIndex >= state.history.length - 1) return;
+  state.historyIndex++;
+  state.boxes = cloneBoxes(state.history[state.historyIndex]);
+  state.selectedBoxIndex = -1;
+  updateUndoRedoButtons();
+  updateSelectionInspector();
+  render();
+  setDirty(state.historyIndex !== 0);
+}
+
+function updateUndoRedoButtons() {
+  if (elements.btnUndo) elements.btnUndo.disabled = state.historyIndex <= 0;
+  if (elements.btnRedo) elements.btnRedo.disabled = state.historyIndex >= state.history.length - 1;
+}
+
+function setDirty(value) {
+  state.isDirty = value;
+  if (elements.unsavedIndicator) elements.unsavedIndicator.classList.toggle('hidden', !value);
+}
+
+// --- LABEL LIST (Pole 1 / Pole 2 / ... sidebar, synced with canvas selection) ---
+
+// Whether a box matches the active labels-list filter chip. Filters only
+// change what's shown in this list -- they never delete/hide boxes on the
+// canvas or affect what gets saved.
+function boxMatchesLabelFilter(box, filter) {
+  if (filter === 'all') return true;
+  const attrs = box.attributes || {};
+  const decision = attrs.decision; // 'ACCEPT' | 'REVIEW' | 'REJECT' | undefined
+  if (filter === 'accept') return decision === 'ACCEPT' || (!decision && !box.needs_review);
+  if (filter === 'review') return decision === 'REVIEW' || (!decision && box.needs_review);
+  if (filter === 'reject') return decision === 'REJECT';
+  if (filter === 'disagreement') return !!(attrs.disagreements && attrs.disagreements.length > 0);
+  if (filter === 'geometry_warning') return attrs.geometry_status === 'warning' || attrs.geometry_status === 'fail';
+  return true;
+}
+
+function setLabelFilter(filter) {
+  state.labelFilter = filter;
+  if (elements.labelsFilterChips) {
+    elements.labelsFilterChips.querySelectorAll('.filter-chip').forEach(chip => {
+      chip.classList.toggle('active', chip.dataset.filter === filter);
+    });
+  }
+  renderLabelList();
+}
+
+function renderLabelList() {
+  if (!elements.labelsList) return;
+  const boxes = state.boxes || [];
+  if (elements.labelsCountBadge) elements.labelsCountBadge.textContent = boxes.length;
+
+  if (boxes.length === 0) {
+    elements.labelsList.innerHTML = '<div class="labels-empty">No labels on this image.</div>';
+    return;
+  }
+
+  const filter = state.labelFilter || 'all';
+  const visibleIndices = boxes
+    .map((box, idx) => ({ box, idx }))
+    .filter(({ box }) => boxMatchesLabelFilter(box, filter));
+
+  if (visibleIndices.length === 0) {
+    elements.labelsList.innerHTML = `<div class="labels-empty">No labels match filter "${filter.replace('_', ' ')}".</div>`;
+    return;
+  }
+
+  elements.labelsList.innerHTML = '';
+  visibleIndices.forEach(({ box, idx }) => {
+    const row = document.createElement('div');
+    row.className = 'label-row' + (idx === state.selectedBoxIndex ? ' selected' : '');
+
+    const attrs = box.attributes || {};
+    const isHuman = (box.model_source || '').toUpperCase() === 'HUMAN';
+    const sourceLabel = isHuman ? 'Human' : (box.model_source || 'AI');
+    const decision = attrs.decision;
+    const statusLabel = decision || (box.needs_review ? 'Review' : 'Verified');
+    const statusClass = decision === 'ACCEPT' ? 'verified' : decision === 'REJECT' ? 'rejected'
+      : decision === 'REVIEW' ? 'review' : (box.needs_review ? 'review' : 'verified');
+    const hasQuality = typeof attrs.quality_score === 'number';
+    const qualityText = hasQuality ? `Q: ${attrs.quality_score.toFixed(2)}` : '';
+    const hasDisagreement = attrs.disagreements && attrs.disagreements.length > 0;
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'label-row-name';
+    nameEl.textContent = `Pole ${idx + 1}`;
+
+    const sourceEl = document.createElement('span');
+    sourceEl.className = 'label-row-source' + (isHuman ? ' human' : '');
+    sourceEl.textContent = sourceLabel;
+
+    row.appendChild(nameEl);
+    row.appendChild(sourceEl);
+    if (qualityText) {
+      const qEl = document.createElement('span');
+      qEl.className = 'label-row-quality';
+      qEl.textContent = qualityText;
+      row.appendChild(qEl);
+    }
+    if (hasDisagreement) {
+      const dEl = document.createElement('span');
+      dEl.className = 'label-row-disagreement';
+      dEl.textContent = '⚠ disagreement';
+      dEl.title = attrs.disagreements.join('; ');
+      row.appendChild(dEl);
+    }
+    const statusEl = document.createElement('span');
+    statusEl.className = `label-row-status ${statusClass}`;
+    statusEl.textContent = statusLabel;
+    row.appendChild(statusEl);
+
+    row.addEventListener('click', () => {
+      state.selectedBoxIndex = idx;
+      updateSelectionInspector();
+      render();
+    });
+    elements.labelsList.appendChild(row);
+  });
+}
+
+// --- IMAGE STATUS BADGE ---
+
+function updateImageStatusBadge() {
+  if (!elements.imageStatusBadge) return;
+  const meta = state.activeImageMeta;
+  if (!meta) {
+    elements.imageStatusBadge.classList.add('hidden');
+    return;
+  }
+  const status = meta.status || 'unlabeled';
+  const verifiedStatuses = ['verified', 'accepted', 'human_corrected'];
+  let label = status.replace('_', ' ');
+  let cssClass = status;
+  if (meta.needs_review && !verifiedStatuses.includes(status)) {
+    label = 'needs review';
+    cssClass = 'needs_review';
+  }
+  elements.imageStatusBadge.textContent = label;
+  elements.imageStatusBadge.className = `status-tag ${cssClass}`;
+  elements.imageStatusBadge.classList.remove('hidden');
+}
+
+// --- SAFE FETCH: clear errors instead of "Unexpected token '<'" ---
+// If the DeepThink proxy (or any reverse proxy) misroutes a request, the
+// response is often an HTML error page, not JSON -- calling res.json() on
+// that throws a cryptic SyntaxError. This checks content-type first and
+// raises a message that actually explains what happened.
+
+async function fetchJson(url, options) {
+  let res;
+  try {
+    res = await fetch(url, options);
+  } catch (netErr) {
+    throw new Error(`Network error reaching the backend (${netErr.message}). Check the API/proxy connection.`);
+  }
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    const text = await res.text().catch(() => '');
+    throw new Error(
+      `Server returned a non-JSON response (HTTP ${res.status}). This usually means the request ` +
+      `didn't reach the backend (a proxy/routing issue), not an application error.` +
+      (text ? ` Response started with: ${text.slice(0, 200).replace(/\s+/g, ' ')}` : '')
+    );
+  }
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.detail || `Request failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
+// --- OBB COORDINATE VALIDATION (before save/export) ---
+
+function validateBoxesForSave(boxes) {
+  const errors = [];
+  boxes.forEach((box, idx) => {
+    const corners = box.corners;
+    if (!Array.isArray(corners) || corners.length !== 4) {
+      errors.push(`Pole ${idx + 1}: must have exactly 4 corners (has ${corners ? corners.length : 0}).`);
+      return;
+    }
+    for (const pt of corners) {
+      if (!Array.isArray(pt) || pt.length !== 2 || !Number.isFinite(pt[0]) || !Number.isFinite(pt[1])) {
+        errors.push(`Pole ${idx + 1}: corner coordinates must be finite numbers (got ${JSON.stringify(pt)}).`);
+        return;
+      }
+    }
+    const area = Math.abs(signedShoelaceArea(corners));
+    if (!(area > 1e-6)) {
+      errors.push(`Pole ${idx + 1}: has zero/degenerate area -- drag its corners apart before saving.`);
+    }
+  });
+  return errors;
+}
+
+/**
+ * Clamp corners to the image bounds (poles may legitimately extend to/past
+ * the frame edge -- clamp rather than reject) and return a deep copy safe to
+ * send to the backend. Does not mutate the live editing state.
+ */
+function clampBoxesToImageBounds(boxes, imgWidth, imgHeight) {
+  return boxes.map(box => ({
+    ...box,
+    corners: box.corners.map(([x, y]) => [
+      Math.min(Math.max(x, 0), imgWidth),
+      Math.min(Math.max(y, 0), imgHeight),
+    ]),
+  }));
 }
 
 // --- AI INFERENCE INTEGRATION ---
 
 async function triggerInference(mode) {
   if (!state.activeImageMeta) return;
-  const msg = mode === 'AI_LABEL' 
-    ? 'Running AI Label Waterfall (YOLO -> SAM)...' 
+  const token = activeLoadToken; // snapshot: discard the result if the user navigates away before it lands
+  const msg = mode === 'AI_LABEL'
+    ? 'Running AI Label Waterfall (YOLO -> SAM)...'
     : 'Running All Models (YOLO + Grounding DINO + SAM)... (~15s on CPU)';
   showSpinner(msg);
   try {
-    const res = await fetch('/api/inference/detect', {
+    const res = await fetch(API_BASE + 'api/inference/detect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1208,6 +1687,7 @@ async function triggerInference(mode) {
       })
     });
     const data = await res.json();
+    if (token !== activeLoadToken) return; // active image changed while this request was in flight
     state.boxes = (data.boxes || []).map(b => ({
       ...b,
       corners: orderCornersCanonical(b.corners)
@@ -1228,6 +1708,7 @@ async function refineSelectedWithSAM() {
     alert('Please select an OBB on the canvas to refine.');
     return;
   }
+  const token = activeLoadToken; // snapshot: discard the result if the user navigates away before it lands
   const box = state.boxes[state.selectedBoxIndex];
   showSpinner('Refining with SAM segmentation...');
   try {
@@ -1237,8 +1718,8 @@ async function refineSelectedWithSAM() {
       const ys = box.corners.map(p => p[1]);
       xyxy = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
     }
-    
-    const res = await fetch('/api/inference/segment_box', {
+
+    const res = await fetch(API_BASE + 'api/inference/segment_box', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1248,8 +1729,14 @@ async function refineSelectedWithSAM() {
       })
     });
     const data = await res.json();
+    // Bail if the active image changed, or this box is no longer the one
+    // in state.boxes (e.g. a fresh AI inference run replaced the array
+    // while this refine request was in flight) -- otherwise we'd either
+    // corrupt the wrong image's boxes or silently mutate a detached object.
+    if (token !== activeLoadToken || state.boxes[state.selectedBoxIndex] !== box) return;
     if (data.corners) {
       box.corners = orderCornersCanonical(data.corners);
+      box.xyxy = cornersToXyxy(box.corners);
       box.model_source = 'SAM';
       updateSelectionInspector();
       render();
@@ -1287,10 +1774,16 @@ function setPositiveTags(tags) {
  */
 async function acceptCurrentAnnotation() {
   if (!state.activeImageMeta || !state.imageObj) return;
+  const validationErrors = validateBoxesForSave(state.boxes);
+  if (validationErrors.length > 0) {
+    alert('Cannot save -- fix these OBBs first:\n\n' + validationErrors.join('\n'));
+    return;
+  }
   const tags = getSelectedPositiveTags();
   showSpinner('Accepting annotation as ground truth...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`, {
+    const clamped = clampBoxesToImageBounds(state.boxes, state.imageObj.width, state.imageObj.height);
+    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1299,18 +1792,18 @@ async function acceptCurrentAnnotation() {
         is_human: true,
         action: 'accepted',
         al_categories: tags.length > 0 ? tags : ['clear_positive'],
-        boxes: state.boxes.map(b => ({
+        boxes: clamped.map(b => ({
           ...b,
           needs_review: false
         }))
       })
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    
+
     // Flash green feedback
     elements.btnAccept.classList.add('flash-success');
     setTimeout(() => elements.btnAccept.classList.remove('flash-success'), 600);
-    
+
+    setDirty(false);
     // Refresh stats and advance to next image
     await loadDatasetImages(state.activeDatasetId);
     if (state.activeImageIndex < state.images.length - 1) {
@@ -1329,10 +1822,16 @@ async function acceptCurrentAnnotation() {
  */
 async function saveEditsCurrentAnnotation() {
   if (!state.activeImageMeta || !state.imageObj) return;
+  const validationErrors = validateBoxesForSave(state.boxes);
+  if (validationErrors.length > 0) {
+    alert('Cannot save -- fix these OBBs first:\n\n' + validationErrors.join('\n'));
+    return;
+  }
   const tags = getSelectedPositiveTags();
   showSpinner('Saving human corrections...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`, {
+    const clamped = clampBoxesToImageBounds(state.boxes, state.imageObj.width, state.imageObj.height);
+    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1341,7 +1840,7 @@ async function saveEditsCurrentAnnotation() {
         is_human: true,
         action: 'human_corrected',
         al_categories: tags,
-        boxes: state.boxes.map(b => ({
+        boxes: clamped.map(b => ({
           ...b,
           model_source: b.model_source || 'HUMAN',
           confidence: 1.0,
@@ -1349,12 +1848,12 @@ async function saveEditsCurrentAnnotation() {
         }))
       })
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    
+
     // Flash blue feedback
     elements.btnAcceptVerify.classList.add('flash-info');
     setTimeout(() => elements.btnAcceptVerify.classList.remove('flash-info'), 600);
-    
+
+    setDirty(false);
     // Refresh stats and advance
     await loadDatasetImages(state.activeDatasetId);
     if (state.activeImageIndex < state.images.length - 1) {
@@ -1389,7 +1888,7 @@ async function confirmRejectCurrent() {
   
   showSpinner('Recording negative / candidate failure...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/reject`, {
+    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1398,11 +1897,11 @@ async function confirmRejectCurrent() {
         al_categories: [failureType, negativeCategory]
       })
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    
+
     elements.btnReject.classList.add('flash-danger');
     setTimeout(() => elements.btnReject.classList.remove('flash-danger'), 600);
-    
+
+    setDirty(false);
     await loadDatasetImages(state.activeDatasetId);
     if (state.activeImageIndex < state.images.length - 1) {
       selectImage(state.activeImageIndex + 1);
@@ -1421,7 +1920,7 @@ async function toggleTestSetCurrent() {
   if (!state.activeImageMeta) return;
   showSpinner('Updating test set isolation...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/test_set`, {
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/test_set`, {
       method: 'POST'
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1458,7 +1957,7 @@ function updateTestSetUI(isTestSet) {
 async function loadDatasetComposition() {
   if (!state.activeDatasetId) return;
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/composition`);
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/composition`);
     if (!res.ok) return;
     const comp = await res.json();
     
@@ -1498,7 +1997,7 @@ async function exportTestSet() {
   if (!state.activeDatasetId) return;
   showSpinner('Exporting fixed test set benchmark...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/export_test_set`, { method: 'POST' });
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/export_test_set`, { method: 'POST' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     alert(`Fixed Test Set Export Complete!\n\nPath: ${data.result.export_path}\nImages Exported: ${data.result.count}`);
@@ -1516,7 +2015,7 @@ async function scanDuplicates() {
   if (!state.activeDatasetId) return;
   showSpinner('Scanning perceptual near-duplicates (pHash)...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/duplicates`);
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/duplicates`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const dups = data.duplicates || [];
@@ -1540,7 +2039,7 @@ async function loadNextDifficultImage() {
   if (!state.activeDatasetId) return;
   showSpinner('Finding next difficult image...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/next_difficult`);
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/next_difficult`);
     if (res.status === 404) {
       hideSpinner();
       alert('No more difficult images pending review. All images have been reviewed!');
@@ -1579,7 +2078,7 @@ async function loadActiveLearningQueue() {
   try {
     const filterVal = elements.alFilterSelect.value;
     const filterParam = filterVal && filterVal !== 'all' ? `?filter_reason=${filterVal}` : '';
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/active_learning${filterParam}`);
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/active_learning${filterParam}`);
     if (!res.ok) return;
     const data = await res.json();
     const queue = data.queue || [];
@@ -1639,7 +2138,7 @@ async function exportHardCases() {
   if (!state.activeDatasetId) return;
   showSpinner('Exporting hard cases...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/export_hard_cases?min_priority=60`, {
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/export_hard_cases?min_priority=60`, {
       method: 'POST'
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1658,7 +2157,7 @@ async function exportHardCases() {
 async function exportDataset() {
   showSpinner('Exporting YOLO-OBB dataset...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/export`, { method: 'POST' });
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/export`, { method: 'POST' });
     const data = await res.json();
     alert(`YOLO-OBB Export Successful!\n\nExport Path: ${data.result.export_path}\nImages Exported: ${data.result.exported_images}\nTrain: ${data.result.train_count}, Val: ${data.result.val_count}`);
   } catch (err) {
@@ -1673,7 +2172,7 @@ async function exportDataset() {
 async function startBatchJob() {
   elements.btnStartBatch.disabled = true;
   try {
-    const res = await fetch('/api/batch/start', {
+    const res = await fetch(API_BASE + 'api/batch/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1681,7 +2180,9 @@ async function startBatchJob() {
         mode: elements.batchModeSelect.value,
         conf_threshold: 0.25,
         only_unlabeled: elements.batchUnlabeledOnly.checked,
-        use_sam_refinement: elements.batchSamRefine.checked
+        use_sam_refinement: elements.batchSamRefine.checked,
+        enable_geometry_qa: elements.batchGeometryQa ? elements.batchGeometryQa.checked : true,
+        qwen_gating: elements.batchQwenGating ? elements.batchQwenGating.value : null
       })
     });
     const data = await res.json();
@@ -1699,7 +2200,7 @@ async function startBatchJob() {
 
 async function pollBatchStatus() {
   try {
-    const res = await fetch('/api/batch/status');
+    const res = await fetch(API_BASE + 'api/batch/status');
     const data = await res.json();
     const job = data.job;
     
@@ -1736,7 +2237,7 @@ async function runImageImport() {
   }
   showSpinner('Importing images...');
   try {
-    const res = await fetch(`/api/datasets/${state.activeDatasetId}/import`, {
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/import`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source_dir: dirPath })
@@ -1757,7 +2258,19 @@ async function runImageImport() {
 function handleKeyDown(e) {
   // Ignore shortcuts when typing in an input
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
-  
+
+  const ctrlOrCmd = e.ctrlKey || e.metaKey;
+  if (ctrlOrCmd && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    if (e.shiftKey) redo(); else undo();
+    return;
+  }
+  if (ctrlOrCmd && (e.key === 'y' || e.key === 'Y')) {
+    e.preventDefault();
+    redo();
+    return;
+  }
+
   if (e.key === 'a' || e.key === 'A') {
     e.preventDefault();
     acceptCurrentAnnotation();
@@ -1769,7 +2282,10 @@ function handleKeyDown(e) {
     saveEditsCurrentAnnotation();
   } else if (e.key === 's' || e.key === 'S') {
     refineSelectedWithSAM();
-  } else if (e.key === 'd' || e.key === 'D' || e.key === 'Delete') {
+  } else if (e.key === 'd' || e.key === 'D' || e.key === 'Delete' || e.key === 'Backspace') {
+    // Backspace must be prevented here -- unhandled, most browsers treat it
+    // as "navigate back" once focus isn't in an editable field.
+    e.preventDefault();
     deleteSelectedBox();
   } else if (e.key === 'w' || e.key === 'W') {
     setToolMode('draw');
