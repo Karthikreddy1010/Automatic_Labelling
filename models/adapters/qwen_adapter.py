@@ -305,7 +305,13 @@ class QwenVerifier(BaseVerifier):
         return _extract_json(text)
 
     def _verify_via_dashscope(self, b64_image: str, prompt: str) -> Dict[str, Any]:
-        import dashscope
+        try:
+            import dashscope  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "dashscope package is not installed. Install it with `pip install dashscope` "
+                "to use the DashScope cloud fallback."
+            ) from exc
 
         response = dashscope.MultiModalConversation.call(
             api_key=self.api_key,
