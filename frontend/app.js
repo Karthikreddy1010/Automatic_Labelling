@@ -1671,7 +1671,7 @@ async function triggerInference(mode) {
   if (!state.activeImageMeta) return;
   const token = activeLoadToken; // snapshot: discard the result if the user navigates away before it lands
   const msg = mode === 'AI_LABEL'
-    ? 'Running AI Label Waterfall (YOLO -> SAM)...'
+    ? 'Running AI Label (DINO + SAM3 -> SAM refine -> Geometry QA -> Qwen -> Decision)...'
     : 'Running All Models (YOLO + Grounding DINO + SAM)... (~15s on CPU)';
   showSpinner(msg);
   try {

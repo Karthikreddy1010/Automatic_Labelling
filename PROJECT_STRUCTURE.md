@@ -95,11 +95,9 @@ run_app.bat, run_app.ps1     # Windows launch shortcuts for run_backend.py
 ## 2. Documentation
 
 ```
-README.md              # Quick start + key workflows (STALE: still describes
-                        # the pre-this-session YOLO-first/DINO-fallback
-                        # architecture; see REQUIREMENTS.md's header)
-ARCHITECTURE.md         # System topology + OBB geometry guarantees (partially
-                        # stale: predates SAM3/GeometryQA/Qwen/DecisionEngine)
+README.md              # Quick start + key workflows (current)
+ARCHITECTURE.md         # System topology, AI pipeline flow, OBB geometry
+                        # guarantees, storage hierarchy (current)
 REQUIREMENTS.md          # Functional/non-functional requirements (current)
 PROJECT_STRUCTURE.md     # This file
 PROJECT_SUMMARY.md       # Describes the OLDER pipeline (section 6) --

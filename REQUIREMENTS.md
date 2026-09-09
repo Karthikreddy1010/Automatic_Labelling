@@ -6,12 +6,11 @@
 > the **current, actual** implementation — not an aspirational target — so it
 > should be updated whenever a requirement changes, not treated as frozen.
 >
-> **Note:** [README.md](README.md) and [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md)
-> currently describe an earlier architecture (a YOLO-first production
-> waterfall with a Grounding DINO fallback) that has since been replaced by
-> the pipeline described in section 2.2 below. They have not been updated to
-> match; treat this document and [ARCHITECTURE.md](ARCHITECTURE.md) as the
-> more current sources for pipeline behavior.
+> **Note:** [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md)
+> have been updated to match the pipeline described in section 2.2 below.
+> [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) describes a separate, older
+> pipeline (see [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) section 6) and
+> is intentionally left as-is.
 
 ## 1. Purpose
 
