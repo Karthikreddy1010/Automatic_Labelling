@@ -6,9 +6,8 @@ together). This document maps the actual repository layout.
 
 The repo holds **two generations of work**: the active PoleAnnotator AI app
 (sections 1–5 below), and an earlier CLI-based detection/relabeling pipeline
-that PROJECT_SUMMARY.md describes and that predates it (section 6). They
-share `src/`, `models/`, and some root-level scripts, so both are documented
-here rather than pretending the older one doesn't exist.
+that PROJECT_SUMMARY.md describes and that predates it (now isolated in
+`legacy/`, section 6). They share `src/` and `models/`.
 
 ## 1. PoleAnnotator AI application (active)
 
@@ -84,10 +83,6 @@ tests/
 ├── test_adapters.py                                               # Adapter base contracts
 └── test_phase13_e2e_acceptance.py                                # 10-image E2E (needs real images)
 
-benchmark_dino_sam.py       # Small-image-set harness for the production
-                             # pipeline: single-config runs, --compare-configs
-                             # (the spec's A/B/C/D verification configs side
-                             # by side), --ground-truth-dir for real P/R
 run_backend.py               # One-command launcher (FastAPI + static frontend)
 run_app.bat, run_app.ps1     # Windows launch shortcuts for run_backend.py
 ```
@@ -122,21 +117,13 @@ requirements.txt    # Pinned to versions actually installed/verified in the
 ## 4. Evaluation / QA artifacts
 
 ```
-eval_upload/
-├── montage.jpg, montage_hightilt.jpg   # The two composite test images used
-│                                        # throughout this session's live
-│                                        # testing (no other local images
-│                                        # currently exist to test against)
-├── labels/                              # 2789 auto-labeled GSV images
-│                                        # (older pipeline output)
-├── predictions.json
-├── compute.py, score_and_post.py        # Older pipeline's Fly.io upload/
-                                          # scoring scripts (review_tool/)
-
 output/
 ├── results/    # Evaluation reports, dashboards, CSVs -- mixed current/older
-└── (benchmark_dino_sam.py writes here by default: output/benchmark_30/,
-    output/verify_compare/, etc. -- not currently present, created on run)
+└── (legacy/pipeline/benchmark_dino_sam.py writes here by default:
+    output/benchmark_30/, output/verify_compare/, etc.)
+
+(legacy/eval_upload/ holds the older pipeline's evaluation artifacts:
+ montage test images, labels/, predictions.json, upload/scoring scripts)
 ```
 
 ## 5. Root-level app entry points
@@ -144,9 +131,9 @@ output/
 | File | Purpose |
 |---|---|
 | `run_backend.py` | Starts the FastAPI server + opens the browser |
-| `pipeline.py` | CLI pipeline runner (`run_evaluation()` etc., shared with the older pipeline) |
+| `run_app.bat` / `run_app.ps1` | Windows shortcuts for `run_backend.py` |
 
-## 6. Older pipeline (pre-dates PoleAnnotator AI, still present)
+## 6. Older pipeline (pre-dates PoleAnnotator AI, isolated in `legacy/`)
 
 Per [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md): a separate, earlier GSV →
 detect → segment → measure → CSV pipeline (YOLO26x + SAM 2.1 for attribute
@@ -154,36 +141,37 @@ extraction, hosted review tool on Fly.io). Shares `src/` and `models/` with
 the app above but is otherwise independent — none of it is imported by
 `backend/app.py`.
 
+All legacy material has been moved into `legacy/` to keep the root clean:
+
 ```
-_gen_candidates.py, detect_sam.py, draw_disputed.py, eval_detector.py,
-eval_hybrid.py, evaluate_seg.py, extract_attributes.py, hybrid_poles.py,
-mask_bench.py, pole_env.py, pole_sam.py, predict.py, predict_sam3.py,
-refine_labels.py, sam3_poles.py, score_gold.py, train.py, train_detector.py,
-train_seg.py, run_det_smoke.sh, run_train.sh
-    # Standalone CLI scripts for the older detect/train/eval workflow.
-    # pole_sam.py's _clean()/_pole_score() ARE reused by the current app's
-    # models/adapters/sam21_adapter.py, sam3_adapter.py, and quality.py --
-    # not fully independent of section 1.
+legacy/
+├── README.md
+├── pipeline/             # All standalone CLI scripts:
+│   ├── pole_sam.py           # _clean()/_pole_score() optionally reused by
+│   │                          # models/adapters/ via try/except ImportError
+│   ├── benchmark_dino_sam.py # Benchmark harness (run: python legacy/pipeline/benchmark_dino_sam.py ...)
+│   ├── pipeline.py
+│   ├── _gen_candidates.py, detect_sam.py, draw_disputed.py,
+│   │   eval_detector.py, eval_hybrid.py, evaluate_seg.py,
+│   │   extract_attributes.py, hybrid_poles.py, mask_bench.py,
+│   │   pole_env.py, predict.py, predict_sam3.py, refine_labels.py,
+│   │   sam3_poles.py, score_gold.py, train.py, train_detector.py,
+│   │   train_seg.py, run_det_smoke.sh, run_train.sh
+├── relabel/              # Auto-relabeling: candidate gen, LLM-judge calib,
+│                          # versioned review batches v6/v7
+├── review_tool/          # Standalone Flask/Fly.io human-review app
+├── eval_upload/          # Montage test images, predictions.json, upload scripts
+└── datasets/
+    ├── Final_Dataset_allpole/   # Training splits for the older detector
+    └── Final_Dataset_refined/   # Refined training splits
+```
 
-relabel/     # Auto-relabeling pipeline (candidate generation, LLM-judge
-             # calibration, versioned review batches v6/v7) for the older
-             # dataset -- gen_candidates.py, judge.py, judge_calibrate*.py
-
-review_tool/  # Standalone Flask/Fly.io app for human review of the older
-              # pipeline's auto-labels -- separate deployment from
-              # PoleAnnotator AI's own FastAPI app
-
-Final_Dataset_allpole/, Final_Dataset_refined/   # Training data splits
-    # (train/val/test with labels + labels_qwen3 variants) for the older
-    # detector, plus their data.yaml files
-
-src/  (the non-geometry_obb.py modules)
+src/  (the non-geometry_obb.py modules, still shared with the app)
 ├── attribute_extraction.py    # Height/tilt/width from mask + camera geometry
 ├── auto_annotate.py
 ├── data_preprocessing.py
 ├── evaluation.py               # DetectionEvaluator -- reused by
-│                                # benchmark_dino_sam.py's --ground-truth-dir
+│                                # legacy/pipeline/benchmark_dino_sam.py --ground-truth-dir
 ├── gsv_collector.py            # Google Street View image collection
 ├── huggingface_models.py
 └── model_comparison.py
-```
