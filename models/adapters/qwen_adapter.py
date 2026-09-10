@@ -57,42 +57,52 @@ import base64
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, Tuple
 import numpy as np
 from PIL import Image
 
 from models.adapters.base import BaseVerifier, DetectionBox, ModelInfo
+from models.adapters.qwen3vl_transformers_backend import Qwen3VLTransformersBackend
 
 VERIFY_PROMPT_TEMPLATE = (
     "You are an expert electric utility inspector verifying an oriented bounding box (OBB)\n"
     "candidate produced by an automated detector, for a utility-pole labeling dataset.\n"
-    "You are given the original image for context and a focused crop of the candidate.\n"
+    "You are given TWO images: (1) a tight crop of exactly the candidate region, and\n"
+    "(2) a wider context crop around it -- use the context image to tell utility poles\n"
+    "apart from trees, tree trunks, street signs, light poles, buildings, and wires without\n"
+    "a supporting pole, all of which can look similar in a tight crop alone.\n"
     "Candidate Bounding Box (xyxy, pixels): {xyxy}\n"
     "Candidate OBB Corners: {corners}\n"
     "Detector Source: {model_source}, Detector Confidence: {confidence}\n\n"
     "Utility poles may be made of wood, steel, concrete, composite, or other materials --\n"
     "do not require wood. Do not reject a candidate merely because it is partially occluded,\n"
     "wires aren't clearly visible, it is slightly tilted, or it has unusual equipment, or only\n"
-    "part of the pole is visible -- those are normal cases. Only mark visibility as\n"
-    "severely_occluded or too_distant when truly hard to assess; do not force an accept/reject\n"
-    "for those, prefer review.\n\n"
-    "Classify the candidate crop and respond ONLY with a valid JSON object matching this exact schema:\n"
+    "part of the pole is visible -- those are normal cases. Only mark visibility as low or\n"
+    "occlusion as high when truly hard to assess; do not force accept/reject for those,\n"
+    "prefer marking annotation_suitable appropriately instead.\n\n"
+    "Classify the candidate and respond ONLY with a valid JSON object matching this exact schema:\n"
     "{{\n"
+    '  "is_utility_pole": true,\n'
+    '  "pole_type": "utility_pole",\n'
     '  "class": "electric_utility_pole",\n'
     '  "material": "wood",\n'
-    '  "visibility": "mostly_visible",\n'
+    '  "visibility": "high",\n'
+    '  "occlusion": "low",\n'
+    '  "truncated": false,\n'
     '  "orientation": "slightly_tilted",\n'
-    '  "semantic_confidence": 0.94,\n'
-    '  "decision": "accept",\n'
-    '  "reason": "Candidate has the characteristic elongated pole structure and visible electrical equipment."\n'
+    '  "annotation_suitable": true,\n'
+    '  "confidence": 0.94,\n'
+    '  "reason": "Vertical wooden pole carrying utility wires, clearly a utility pole in context."\n'
     "}}\n\n"
     'class must be one of: "electric_utility_pole", "non_utility_pole", "tree", '
     '"building_or_structure", "street_light_or_lamp_post", "other_object", "uncertain".\n'
     'material must be one of: "wood", "steel", "concrete", "composite", "unknown".\n'
-    'visibility must be one of: "mostly_visible", "partially_occluded", "severely_occluded", "too_distant".\n'
+    'visibility must be one of: "high", "medium", "low".\n'
+    'occlusion must be one of: "none", "low", "medium", "high".\n'
     'orientation must be one of: "vertical", "slightly_tilted", "strongly_tilted".\n'
-    'decision must be one of: "accept", "review", "reject".\n'
-    "semantic_confidence is a float between 0.0 and 1.0."
+    "confidence is a float between 0.0 and 1.0 (this is your own self-reported confidence, "
+    "not a calibrated probability -- the application combines it with other independent "
+    "signals to make the final decision)."
 )
 
 _VALID_CLASSES = {
@@ -100,9 +110,20 @@ _VALID_CLASSES = {
     "building_or_structure", "street_light_or_lamp_post", "other_object", "uncertain",
 }
 _VALID_MATERIALS = {"wood", "steel", "concrete", "composite", "unknown"}
+# Existing internal schema's visibility buckets (kept for decision_engine.py's
+# "severely_occluded"/"too_distant" review-cap check) plus the spec's simpler
+# high/medium/low, accepted as valid raw input and mapped onto the internal
+# buckets below.
 _VALID_VISIBILITY = {"mostly_visible", "partially_occluded", "severely_occluded", "too_distant"}
+_SPEC_VISIBILITY = {"high", "medium", "low"}
 _VALID_ORIENTATION = {"vertical", "slightly_tilted", "strongly_tilted"}
 _VALID_DECISION = {"accept", "review", "reject"}
+_VALID_OCCLUSION = {"none", "low", "medium", "high"}
+_SPEC_VISIBILITY_TO_INTERNAL = {
+    "high": "mostly_visible",
+    "medium": "partially_occluded",
+    "low": "severely_occluded",
+}
 
 
 def _normalize_qwen_response(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -111,31 +132,81 @@ def _normalize_qwen_response(data: Dict[str, Any]) -> Dict[str, Any]:
     missing keys or unrecognized enum values (normalized to "uncertain" /
     "unknown" rather than raising) -- a malformed field must never crash the
     pipeline, it should just fall back to "we don't know" for that field.
+
+    Accepts BOTH the original internal schema (class/decision/orientation/
+    semantic_confidence) AND the spec's richer schema (is_utility_pole/
+    pole_type/occlusion/truncated/annotation_suitable/confidence) in the same
+    response, normalizing whichever fields are present and deriving the
+    other schema's fields from them when only one side was supplied --
+    decision_engine.py only reads the original schema's keys, so those are
+    always populated regardless of which fields the model actually returned.
     """
     def _enum(key: str, valid: set, default: str) -> str:
         v = str(data.get(key, default)).strip().lower() if data.get(key) is not None else default
         return v if v in valid else default
 
-    cls = _enum("class", _VALID_CLASSES, "uncertain")
-    material = _enum("material", _VALID_MATERIALS, "unknown")
-    visibility = _enum("visibility", _VALID_VISIBILITY, "mostly_visible")
-    orientation = _enum("orientation", _VALID_ORIENTATION, "vertical")
-    decision = _enum("decision", _VALID_DECISION, "review")
+    def _bool(key: str, default: bool) -> bool:
+        v = data.get(key, default)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "yes", "1")
+        return default
 
+    # --- confidence: spec's "confidence" aliases the original "semantic_confidence" ---
+    conf_raw = data.get("semantic_confidence", data.get("confidence", 0.5))
     try:
-        semantic_confidence = float(data.get("semantic_confidence", 0.5))
-        semantic_confidence = max(0.0, min(1.0, semantic_confidence))
+        semantic_confidence = max(0.0, min(1.0, float(conf_raw)))
     except (TypeError, ValueError):
         semantic_confidence = 0.5
 
+    # --- visibility: accept either vocabulary, normalize to the internal one ---
+    raw_visibility = str(data.get("visibility", "")).strip().lower()
+    if raw_visibility in _SPEC_VISIBILITY:
+        visibility = _SPEC_VISIBILITY_TO_INTERNAL[raw_visibility]
+    else:
+        visibility = raw_visibility if raw_visibility in _VALID_VISIBILITY else "mostly_visible"
+
+    occlusion = _enum("occlusion", _VALID_OCCLUSION, "none")
+    truncated = _bool("truncated", False)
+
+    # --- is_utility_pole / class: derive whichever side is missing ---
+    if "is_utility_pole" in data:
+        is_utility_pole = _bool("is_utility_pole", False)
+        cls = _enum("class", _VALID_CLASSES, "electric_utility_pole" if is_utility_pole else "uncertain")
+    else:
+        cls = _enum("class", _VALID_CLASSES, "uncertain")
+        is_utility_pole = cls == "electric_utility_pole"
+
+    pole_type = str(data.get("pole_type", "utility_pole" if is_utility_pole else "uncertain"))[:100]
+
+    orientation = _enum("orientation", _VALID_ORIENTATION, "vertical")
+
+    # --- decision / annotation_suitable: derive whichever side is missing ---
+    if "annotation_suitable" in data:
+        annotation_suitable = _bool("annotation_suitable", False)
+        decision = _enum(
+            "decision", _VALID_DECISION,
+            "accept" if (annotation_suitable and is_utility_pole) else ("reject" if not is_utility_pole else "review"),
+        )
+    else:
+        decision = _enum("decision", _VALID_DECISION, "review")
+        annotation_suitable = decision == "accept"
+
     return {
         "class": cls,
-        "material": material,
+        "material": _enum("material", _VALID_MATERIALS, "unknown"),
         "visibility": visibility,
         "orientation": orientation,
         "semantic_confidence": round(semantic_confidence, 4),
         "decision": decision,
         "reason": str(data.get("reason", ""))[:500] or "No reason provided by Qwen.",
+        # Spec (Part 4) fields, additive:
+        "is_utility_pole": is_utility_pole,
+        "pole_type": pole_type,
+        "occlusion": occlusion,
+        "truncated": truncated,
+        "annotation_suitable": annotation_suitable,
     }
 
 
@@ -225,7 +296,15 @@ class QwenVerifier(BaseVerifier):
         ollama_base_url: Optional[str] = None,
         ollama_timeout_s: Optional[float] = None,
         ollama_preferred_model: Optional[str] = None,
+        context_crop_expand_pct: float = 0.30,
+        backend: str = "auto",
+        transformers_dtype: str = "bfloat16",
+        transformers_device_map: str = "auto",
     ):
+        self.context_crop_expand_pct = context_crop_expand_pct
+        self.backend_preference = backend  # "auto" | "transformers" | "ollama" | "dashscope"
+        self.transformers_dtype = transformers_dtype
+        self.transformers_device_map = transformers_device_map
         self.api_key = (
             api_key or
             os.environ.get("QWEN_API_KEY") or
@@ -245,51 +324,79 @@ class QwenVerifier(BaseVerifier):
             self.ollama_base_url, preferred_model=self.ollama_preferred_model
         )
 
+        # Direct-Transformers Qwen3-VL-8B-Instruct backend (Part 3): only
+        # constructed (not necessarily loaded yet -- load() is lazy, on first
+        # verify() call) when a local checkpoint path is actually configured.
+        # Never required to be present -- is_available()/verify() fall back
+        # to Ollama/DashScope cleanly when it isn't.
+        self._tvl_backend: Optional[Qwen3VLTransformersBackend] = None
+        if self.backend_preference in ("auto", "transformers") and self.local_model_path:
+            self._tvl_backend = Qwen3VLTransformersBackend.get_singleton(
+                self.local_model_path, self.transformers_dtype, self.transformers_device_map,
+            )
+
+        local_checkpoint_exists = bool(self.local_model_path and Path(self.local_model_path).exists())
         self._status = "ready" if (
-            self.ollama_model or self.api_key or (self.local_model_path and Path(self.local_model_path).exists())
+            (self._tvl_backend is not None and local_checkpoint_exists) or self.ollama_model or self.api_key
         ) else "unavailable"
         self._error_msg = None if self._status == "ready" else (
-            f"No vision-capable Qwen model (a '...vl...' tag) found in Ollama at {self.ollama_base_url} "
-            "-- a text-only Qwen model (e.g. qwen2.5-coder) does not count, since this verifier must "
-            "look at an image crop -- and QWEN_API_KEY/DASHSCOPE_API_KEY not set. Run `ollama pull "
-            "qwen2.5vl:7b` (or similar) to enable the local path."
+            f"No local Qwen3-VL-8B-Instruct checkpoint (QWEN_MODEL_PATH), vision-capable Qwen model "
+            f"(a '...vl...' tag) found in Ollama at {self.ollama_base_url} -- a text-only Qwen model "
+            "(e.g. qwen2.5-coder) does not count, since this verifier must look at an image crop -- "
+            "and QWEN_API_KEY/DASHSCOPE_API_KEY not set. Run `ollama pull qwen2.5vl:7b` (or similar), "
+            "or point QWEN_MODEL_PATH at a local Qwen3-VL-8B-Instruct directory, to enable a local path."
         )
 
     def is_available(self) -> bool:
         return self._status == "ready"
 
-    def _crop_and_encode(self, image: Union[str, np.ndarray, Image.Image], detection: DetectionBox) -> str:
-        """Crop to the candidate region (padded) and return a base64 JPEG."""
+    def _load_pil(self, image: Union[str, np.ndarray, Image.Image]) -> Image.Image:
         if isinstance(image, (str, Path)):
-            pil_img = Image.open(str(image)).convert("RGB")
-        elif isinstance(image, np.ndarray):
+            return Image.open(str(image)).convert("RGB")
+        if isinstance(image, np.ndarray):
             rgb = image[:, :, ::-1] if image.ndim == 3 and image.shape[2] == 3 else image
-            pil_img = Image.fromarray(rgb)
-        elif isinstance(image, Image.Image):
-            pil_img = image.convert("RGB")
-        else:
-            raise ValueError(f"Unsupported image type: {type(image)}")
+            return Image.fromarray(rgb)
+        if isinstance(image, Image.Image):
+            return image.convert("RGB")
+        raise ValueError(f"Unsupported image type: {type(image)}")
 
-        w, h = pil_img.size
-        x0, y0, x1, y1 = detection.xyxy
-        pad_w = 0.15 * (x1 - x0)
-        pad_h = 0.15 * (y1 - y0)
-        crop_box = (
-            max(0, int(x0 - pad_w)),
-            max(0, int(y0 - pad_h)),
-            min(w, int(x1 + pad_w)),
-            min(h, int(y1 + pad_h)),
-        )
-        cropped = pil_img.crop(crop_box)
-
+    def _encode_crop(self, pil_img: Image.Image, box: Tuple[int, int, int, int]) -> str:
+        cropped = pil_img.crop(box)
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=90)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    def _verify_via_ollama(self, b64_image: str, prompt: str) -> Dict[str, Any]:
+    def _build_crops(self, image: Union[str, np.ndarray, Image.Image], detection: DetectionBox) -> Tuple[str, str]:
+        """
+        Part 6: build a TIGHT crop (candidate bbox + a small 15% pad, same as
+        before) and a separate, wider CONTEXT crop (bbox expanded by
+        context_crop_expand_pct, default 30%) so Qwen can distinguish a real
+        utility pole from a tree/sign/building that only looks similar up close.
+        Both are returned as base64 JPEG for the caller to send as two images.
+        """
+        pil_img = self._load_pil(image)
+        w, h = pil_img.size
+        x0, y0, x1, y1 = detection.xyxy
+        bw, bh = (x1 - x0), (y1 - y0)
+
+        tight_pad_w, tight_pad_h = 0.15 * bw, 0.15 * bh
+        tight_box = (
+            max(0, int(x0 - tight_pad_w)), max(0, int(y0 - tight_pad_h)),
+            min(w, int(x1 + tight_pad_w)), min(h, int(y1 + tight_pad_h)),
+        )
+
+        ctx_pad_w, ctx_pad_h = self.context_crop_expand_pct * bw, self.context_crop_expand_pct * bh
+        context_box = (
+            max(0, int(x0 - ctx_pad_w)), max(0, int(y0 - ctx_pad_h)),
+            min(w, int(x1 + ctx_pad_w)), min(h, int(y1 + ctx_pad_h)),
+        )
+
+        return self._encode_crop(pil_img, tight_box), self._encode_crop(pil_img, context_box)
+
+    def _verify_via_ollama(self, tight_b64: str, context_b64: str, prompt: str) -> Dict[str, Any]:
         payload = json.dumps({
             "model": self.ollama_model,
-            "messages": [{"role": "user", "content": prompt, "images": [b64_image]}],
+            "messages": [{"role": "user", "content": prompt, "images": [tight_b64, context_b64]}],
             "stream": False,
             "format": "json",
         }).encode("utf-8")
@@ -304,7 +411,17 @@ class QwenVerifier(BaseVerifier):
             raise RuntimeError(f"Ollama returned no content: {data}")
         return _extract_json(text)
 
-    def _verify_via_dashscope(self, b64_image: str, prompt: str) -> Dict[str, Any]:
+    def _verify_via_transformers(self, tight_b64: str, context_b64: str, prompt: str) -> Dict[str, Any]:
+        if not self._tvl_backend.is_loaded():
+            if not self._tvl_backend.load():
+                raise RuntimeError(self._tvl_backend.get_status()["error"] or "Qwen3-VL-8B failed to load")
+
+        tight_img = Image.open(io.BytesIO(base64.b64decode(tight_b64)))
+        context_img = Image.open(io.BytesIO(base64.b64decode(context_b64)))
+        text = self._tvl_backend.generate_json([tight_img, context_img], prompt)
+        return _extract_json(text)
+
+    def _verify_via_dashscope(self, tight_b64: str, context_b64: str, prompt: str) -> Dict[str, Any]:
         try:
             import dashscope  # type: ignore
         except ImportError as exc:
@@ -319,7 +436,8 @@ class QwenVerifier(BaseVerifier):
             messages=[{
                 "role": "user",
                 "content": [
-                    {"image": f"data:image/jpeg;base64,{b64_image}"},
+                    {"image": f"data:image/jpeg;base64,{tight_b64}"},
+                    {"image": f"data:image/jpeg;base64,{context_b64}"},
                     {"text": prompt},
                 ],
             }],
@@ -356,31 +474,46 @@ class QwenVerifier(BaseVerifier):
                 **_unavailable_fields,
             }
 
-        if not self.ollama_model and not self.api_key:
-            # local_model_path was configured, but local HF Qwen-VL inference
-            # isn't implemented -- report that plainly instead of faking a result.
+        if self._tvl_backend is None and not self.ollama_model and not self.api_key:
             return {
                 "status": "unavailable",
                 "decision": "unavailable",
                 "needs_human_review": True,
                 "reason": (
-                    "MODEL UNAVAILABLE: local HuggingFace Qwen-VL inference (QWEN_MODEL_PATH) is not "
-                    "implemented. Run Ollama with a Qwen(-VL) model pulled, or set QWEN_API_KEY/DASHSCOPE_API_KEY."
+                    "MODEL UNAVAILABLE: no local Qwen3-VL-8B checkpoint (QWEN_MODEL_PATH), Ollama "
+                    "model, or API key configured."
                 ),
                 **_unavailable_fields,
             }
 
         try:
-            b64_image = self._crop_and_encode(image, detection)
+            tight_b64, context_b64 = self._build_crops(image, detection)
             prompt = VERIFY_PROMPT_TEMPLATE.format(
                 xyxy=detection.xyxy, corners=detection.corners,
                 model_source=detection.model_source, confidence=detection.confidence,
             )
 
-            if self.ollama_model:
-                raw = self._verify_via_ollama(b64_image, prompt)
-            else:
-                raw = self._verify_via_dashscope(b64_image, prompt)
+            raw = None
+            tvl_error: Optional[Exception] = None
+            if self._tvl_backend is not None:
+                try:
+                    raw = self._verify_via_transformers(tight_b64, context_b64, prompt)
+                except Exception as e:
+                    tvl_error = e
+                    if self.backend_preference == "transformers":
+                        # Explicitly pinned to the transformers backend -- do
+                        # not silently fall back to a different backend the
+                        # deployer didn't ask for; surface the real failure.
+                        raise
+            if raw is None:
+                if self.ollama_model:
+                    raw = self._verify_via_ollama(tight_b64, context_b64, prompt)
+                elif self.api_key:
+                    raw = self._verify_via_dashscope(tight_b64, context_b64, prompt)
+                elif tvl_error is not None:
+                    raise tvl_error
+                else:
+                    raise RuntimeError("No Qwen backend available to handle this request.")
 
             # Malformed/partial JSON (missing keys, bad enum values, wrong
             # types) is normalized here rather than raised -- only a hard
@@ -397,8 +530,12 @@ class QwenVerifier(BaseVerifier):
                 "semantic_confidence": norm["semantic_confidence"],
                 "decision": norm["decision"],
                 "reason": norm["reason"],
-                # Legacy/compat fields derived from the new schema.
-                "is_utility_pole": norm["class"] == "electric_utility_pole",
+                # Spec (Part 4) fields, additive:
+                "is_utility_pole": norm["is_utility_pole"],
+                "pole_type": norm["pole_type"],
+                "occlusion": norm["occlusion"],
+                "truncated": norm["truncated"],
+                "annotation_suitable": norm["annotation_suitable"],
                 "obb_quality": {"accept": "good", "review": "uncertain", "reject": "poor"}[norm["decision"]],
                 "needs_human_review": (
                     norm["decision"] != "accept"
@@ -415,18 +552,44 @@ class QwenVerifier(BaseVerifier):
             }
 
     def get_info(self) -> ModelInfo:
-        backend = f"ollama:{self.ollama_model}" if self.ollama_model else (self.model_name if self.api_key else self.local_model_path)
+        install_guide = (
+            "To enable Qwen visual verification: run a local Ollama server with a Qwen(-VL) model "
+            "pulled, set QWEN_MODEL_PATH to a local Qwen3-VL-8B-Instruct checkpoint for the "
+            "Transformers backend, or set QWEN_API_KEY/DASHSCOPE_API_KEY for the cloud API."
+        )
+        if self._tvl_backend is not None and self._tvl_backend.is_loaded():
+            tvl_status = self._tvl_backend.get_status()
+            return ModelInfo(
+                id="qwen_verifier",
+                name="Qwen3-VL-8B-Instruct",
+                model_type="verifier",
+                status="ready",
+                weights_path=self._tvl_backend.model_path,
+                device=tvl_status["device"],
+                backend="transformers",
+                error_message=None,
+                installation_guide="Loaded locally via Hugging Face Transformers (device_map=auto).",
+            )
+        if self.ollama_model:
+            return ModelInfo(
+                id="qwen_verifier",
+                name=f"Qwen VLM Verifier (Ollama: {self.ollama_model})",
+                model_type="verifier",
+                status=self._status,
+                weights_path=f"ollama:{self.ollama_model}",
+                device="local_ollama",
+                backend="ollama",
+                error_message=self._error_msg,
+                installation_guide=install_guide,
+            )
         return ModelInfo(
             id="qwen_verifier",
-            name="Qwen VLM Verifier" + (f" (Ollama: {self.ollama_model})" if self.ollama_model else ""),
+            name="Qwen VLM Verifier",
             model_type="verifier",
             status=self._status,
-            weights_path=backend,
-            device="local_ollama" if self.ollama_model else "cloud_or_local",
+            weights_path=self.model_name if self.api_key else self.local_model_path,
+            device="cloud" if self.api_key else "cpu",
+            backend="dashscope" if self.api_key else None,
             error_message=self._error_msg,
-            installation_guide=(
-                "To enable Qwen visual verification: run a local Ollama server with a Qwen(-VL) model "
-                "pulled (preferred, no API key needed), or set the QWEN_API_KEY/DASHSCOPE_API_KEY "
-                "environment variable for the cloud API."
-            ),
+            installation_guide=install_guide,
         )

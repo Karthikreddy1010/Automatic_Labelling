@@ -132,7 +132,7 @@ class TestVerifyHandlesMalformedBackendResponse(unittest.TestCase):
         verifier = QwenVerifier(api_key=None, ollama_base_url=UNREACHABLE_OLLAMA_URL)
         verifier._status = "ready"
         verifier.ollama_model = "qwen2.5vl:7b"  # pretend a model was discovered
-        with patch.object(verifier, "_crop_and_encode", return_value="fakebase64"), \
+        with patch.object(verifier, "_build_crops", return_value=("fakebase64tight", "fakebase64context")), \
              patch.object(verifier, "_verify_via_ollama", return_value=["not", "a", "dict"]):
             res = verifier.verify("dummy.jpg", self._dummy_det())
         self.assertEqual(res["status"], "ok")
@@ -143,11 +143,96 @@ class TestVerifyHandlesMalformedBackendResponse(unittest.TestCase):
         verifier = QwenVerifier(api_key=None, ollama_base_url=UNREACHABLE_OLLAMA_URL)
         verifier._status = "ready"
         verifier.ollama_model = "qwen2.5vl:7b"
-        with patch.object(verifier, "_crop_and_encode", side_effect=RuntimeError("corrupt image")):
+        with patch.object(verifier, "_build_crops", side_effect=RuntimeError("corrupt image")):
             res = verifier.verify("dummy.jpg", self._dummy_det())
         self.assertEqual(res["status"], "error")
         self.assertTrue(res["needs_human_review"])
         self.assertIsNone(res["semantic_confidence"])
+
+
+class TestQwenExtendedSchema(unittest.TestCase):
+    """Part 4/5: Qwen's normalized response carries the spec's richer field
+    set (is_utility_pole/pole_type/occlusion/truncated/annotation_suitable)
+    in addition to -- not instead of -- the existing class/decision schema
+    that decision_engine.py already depends on."""
+
+    def test_normalize_adds_new_fields_with_safe_defaults_on_empty_input(self):
+        norm = _normalize_qwen_response({})
+        # Existing fields (decision_engine.py contract) must still be present.
+        for key in ("class", "material", "visibility", "orientation",
+                    "semantic_confidence", "decision", "reason"):
+            self.assertIn(key, norm)
+        # New spec fields.
+        self.assertIn("is_utility_pole", norm)
+        self.assertIn("pole_type", norm)
+        self.assertIn("occlusion", norm)
+        self.assertIn("truncated", norm)
+        self.assertIn("annotation_suitable", norm)
+        self.assertFalse(norm["is_utility_pole"])
+        self.assertFalse(norm["annotation_suitable"])
+        self.assertIn(norm["occlusion"], ("none", "low", "medium", "high"))
+
+    def test_normalize_maps_new_schema_response_correctly(self):
+        raw = {
+            "is_utility_pole": True,
+            "pole_type": "utility_pole",
+            "material": "wood",
+            "visibility": "high",
+            "occlusion": "low",
+            "truncated": False,
+            "annotation_suitable": True,
+            "reason": "Vertical wooden pole carrying utility wires.",
+            "confidence": 0.91,
+        }
+        norm = _normalize_qwen_response(raw)
+        self.assertTrue(norm["is_utility_pole"])
+        self.assertEqual(norm["pole_type"], "utility_pole")
+        self.assertEqual(norm["occlusion"], "low")
+        self.assertFalse(norm["truncated"])
+        self.assertTrue(norm["annotation_suitable"])
+        self.assertAlmostEqual(norm["semantic_confidence"], 0.91)  # "confidence" aliases semantic_confidence
+        # Existing schema still derivable/compatible: a confident is_utility_pole
+        # candidate should not be silently dropped from the old `class` contract.
+        self.assertEqual(norm["class"], "electric_utility_pole")
+        self.assertEqual(norm["decision"], "accept")
+
+    def test_normalize_uncertain_new_schema_example_from_spec(self):
+        raw = {
+            "is_utility_pole": False,
+            "pole_type": "uncertain",
+            "material": "unknown",
+            "visibility": "low",
+            "occlusion": "high",
+            "truncated": True,
+            "annotation_suitable": False,
+            "reason": "Candidate is mostly hidden by vegetation.",
+            "confidence": 0.42,
+        }
+        norm = _normalize_qwen_response(raw)
+        self.assertFalse(norm["is_utility_pole"])
+        self.assertFalse(norm["annotation_suitable"])
+        self.assertEqual(norm["decision"], "reject")
+
+    def test_build_crops_returns_two_distinct_images(self):
+        import numpy as np
+
+        verifier = QwenVerifier(ollama_base_url="http://127.0.0.1:1")  # unreachable, fine for this test
+        img = np.zeros((200, 200, 3), dtype=np.uint8)
+        img[:, :100] = 255  # left half white, right half black -- crops will differ visibly
+        det = DetectionBox(xyxy=(80.0, 50.0, 120.0, 150.0), corners=None, confidence=0.9)
+
+        tight_b64, context_b64 = verifier._build_crops(img, det)
+        self.assertIsInstance(tight_b64, str)
+        self.assertIsInstance(context_b64, str)
+        self.assertGreater(len(tight_b64), 0)
+        self.assertGreater(len(context_b64), 0)
+        # Context crop (expanded bbox) must decode to a larger image than the tight crop.
+        import base64, io
+        from PIL import Image
+        tight_img = Image.open(io.BytesIO(base64.b64decode(tight_b64)))
+        context_img = Image.open(io.BytesIO(base64.b64decode(context_b64)))
+        self.assertGreaterEqual(context_img.size[0] * context_img.size[1],
+                                 tight_img.size[0] * tight_img.size[1])
 
 
 if __name__ == "__main__":

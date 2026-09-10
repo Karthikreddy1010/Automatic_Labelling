@@ -134,6 +134,7 @@ class ModelInfo:
     device: str = "cpu"
     error_message: Optional[str] = None
     installation_guide: Optional[str] = None
+    backend: Optional[str] = None  # e.g. "transformers", "sam3_http", "ollama:qwen3-vl:2b"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -145,6 +146,7 @@ class ModelInfo:
             "device": self.device,
             "error_message": self.error_message,
             "installation_guide": self.installation_guide,
+            "backend": self.backend,
         }
 
 
