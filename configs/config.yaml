@@ -141,6 +141,41 @@ verification_pipeline:
     # "always" -- call Qwen on every surviving candidate regardless of gating,
     #             for A/B evaluation experiments (configs B/D).
     gating: "gated"
+    # Which Qwen backend to use. "auto" tries transformers (if
+    # transformers.model_path/QWEN_MODEL_PATH exists on disk), then a local
+    # Ollama server, then DashScope's cloud API -- first one available wins.
+    # Pin explicitly on HAWK once verified: "transformers".
+    backend: "auto"
+    transformers:
+      # Local Qwen3-VL-8B-Instruct checkpoint directory (HAWK:
+      # /home/maska/models/Qwen3-VL-8B-Instruct). Falls back to the
+      # QWEN_MODEL_PATH env var if null. Never downloaded automatically --
+      # if this path doesn't exist locally, the transformers backend
+      # reports unavailable rather than fetching from the Hub.
+      model_path: null
+      dtype: "bfloat16"
+      device_map: "auto"
+    # Expanded "context crop" sent alongside the tight candidate crop, as a
+    # fraction of the candidate's own width/height (spec: 20-40%; 0.30 is a
+    # reasonable middle default, not a claimed-optimal value).
+    context_crop_expand_pct: 0.30
+
+  sam3:
+    # "auto" prefers an in-process SAM3Adapter (facebook/sam3 via
+    # transformers>=5.9) if its dependencies import cleanly; otherwise falls
+    # back to calling a separately-running SAM3 HTTP service (see
+    # services/sam3_service.py) at `service_url`, for when SAM3's dependency
+    # needs conflict with this app's own torch_env_v2 and it must run in an
+    # isolated environment/process instead.
+    backend: "auto"
+    # e.g. "http://127.0.0.1:8801" -- falls back to the SAM3_SERVICE_URL env
+    # var if null. Only used when backend resolves to "http".
+    service_url: null
+
+  logging:
+    # Emit per-stage timing (dino_ms/sam3_ms/geometry_ms/qwen_ms/obb_ms/
+    # total_ms) into predictions.json's raw_outputs.timings and backend logs.
+    log_stage_timings: true
 
   geometry_qa:
     max_image_area_fraction: 0.35
