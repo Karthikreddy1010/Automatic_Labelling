@@ -214,7 +214,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
   - `QwenVerifier._build_crops(image, detection) -> Tuple[str, str]` — replaces `_crop_and_encode`'s single-image return; returns `(tight_b64, context_b64)`, both base64 JPEG. `context_crop_expand_pct` read from `verification_pipeline.qwen.context_crop_expand_pct` (constructor param, default `0.30`).
   - `QwenVerifier.verify(...)` — same signature, same return dict shape (superset of before).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/test_phase6_qwen.py`:
 
@@ -309,12 +309,12 @@ class TestQwenExtendedSchema(unittest.TestCase):
                                  tight_img.size[0] * tight_img.size[1])
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/test_phase6_qwen.py::TestQwenExtendedSchema -v`
 Expected: FAIL — `AttributeError`/`AssertionError` (`is_utility_pole` not in normalized dict; `_build_crops` doesn't exist yet).
 
-- [ ] **Step 3: Extend the prompt template, enum sets, and `_normalize_qwen_response`**
+- [x] **Step 3: Extend the prompt template, enum sets, and `_normalize_qwen_response`**
 
 In `models/adapters/qwen_adapter.py`, replace `VERIFY_PROMPT_TEMPLATE` and the enum-set constants:
 
@@ -468,7 +468,7 @@ def _normalize_qwen_response(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 ```
 
-- [ ] **Step 4: Add `_build_crops` (tight + context) and wire it into every backend**
+- [x] **Step 4: Add `_build_crops` (tight + context) and wire it into every backend**
 
 Replace `_crop_and_encode` with:
 
@@ -623,12 +623,12 @@ return {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_phase6_qwen.py -v`
 Expected: PASS (all existing tests in this file still pass unchanged, plus the 4 new ones from Step 1).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add models/adapters/qwen_adapter.py tests/test_phase6_qwen.py
@@ -655,7 +655,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - Produces: `class Qwen3VLTransformersBackend` with `load() -> bool`, `is_loaded() -> bool`, `unload() -> None`, `generate_json(images: List[PIL.Image.Image], prompt: str) -> str`, `get_status() -> dict` (`{"available": bool, "model": str, "backend": "transformers", "device": str, "error": str|None}`), and `Qwen3VLTransformersBackend.get_singleton(model_path, dtype, device_map) -> Qwen3VLTransformersBackend` (module-level singleton keyed by `model_path` so a second call with the same path returns the exact same loaded instance — never reloads).
 - Consumes: nothing from earlier tasks except the config keys from Task 1 (`verification_pipeline.qwen.transformers.*`) and PIL images from Task 2's `_build_crops`-derived `Image.Image` objects.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_qwen3vl_transformers.py
@@ -727,12 +727,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_qwen3vl_transformers.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'models.adapters.qwen3vl_transformers_backend'`.
 
-- [ ] **Step 3: Implement the backend**
+- [x] **Step 3: Implement the backend**
 
 ```python
 # models/adapters/qwen3vl_transformers_backend.py
@@ -909,12 +909,12 @@ class Qwen3VLTransformersBackend:
         }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_qwen3vl_transformers.py -v`
 Expected: PASS (6 tests) — all exercise the graceful-failure/singleton-caching contract, which works identically with or without a real checkpoint present.
 
-- [ ] **Step 5: Wire the transformers backend into `QwenVerifier` as a selectable third option**
+- [x] **Step 5: Wire the transformers backend into `QwenVerifier` as a selectable third option**
 
 In `models/adapters/qwen_adapter.py`, extend `__init__`'s backend-selection logic (after the existing `ollama_model`/`api_key` discovery, before computing `self._status`):
 
@@ -983,12 +983,12 @@ if not self._tvl_backend and not self.ollama_model and not self.api_key:
     }
 ```
 
-- [ ] **Step 6: Run the full Qwen test suite to verify no regressions**
+- [x] **Step 6: Run the full Qwen test suite to verify no regressions**
 
 Run: `python -m pytest tests/test_phase6_qwen.py tests/test_qwen3vl_transformers.py -v`
 Expected: PASS, all tests (Task 2's + Task 3's).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add models/adapters/qwen3vl_transformers_backend.py models/adapters/qwen_adapter.py tests/test_qwen3vl_transformers.py
@@ -1018,7 +1018,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - Produces: `class SAM3HttpAdapter(BaseSegmenter)` — same public methods as `SAM3Adapter` (`is_available`, `load`, `unload`, `detect_and_segment`, `segment_box`, `get_info`), so `backend/app.py`'s `sam3_adapter = ...` line is the *only* place that changes when switching backends; every other call site (`sam3_adapter.is_available()`, `.detect_and_segment(...)`, `.segment_box(...)`) is untouched.
 - Consumes: nothing new from earlier tasks (independent of Qwen work); reads Task 1's `verification_pipeline.sam3.backend`/`sam3.service_url` config keys.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_sam3_adapter.py
@@ -1122,12 +1122,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_sam3_adapter.py tests/test_sam3_http_adapter.py -v`
 Expected: `test_sam3_adapter.py`'s `test_get_info_reports_backend_field` FAILs (no `backend` key yet); `test_sam3_http_adapter.py` FAILs entirely with `ModuleNotFoundError`.
 
-- [ ] **Step 3: Add `backend` field to `ModelInfo` and set it in `SAM3Adapter.get_info()`**
+- [x] **Step 3: Add `backend` field to `ModelInfo` and set it in `SAM3Adapter.get_info()`**
 
 In `models/adapters/base.py`, extend the `ModelInfo` dataclass (additive field, default `None` — every existing adapter's `get_info()` keeps working unchanged, `to_dict()` just gains one more key):
 
@@ -1181,7 +1181,7 @@ def get_info(self) -> ModelInfo:
     )
 ```
 
-- [ ] **Step 4: Add native box-prompted segmentation, falling back to the existing crop approach**
+- [x] **Step 4: Add native box-prompted segmentation, falling back to the existing crop approach**
 
 In `models/adapters/sam3_adapter.py`, replace `segment_box`'s body:
 
@@ -1264,7 +1264,7 @@ def segment_box(
     return None
 ```
 
-- [ ] **Step 5: Create the isolated SAM3 microservice**
+- [x] **Step 5: Create the isolated SAM3 microservice**
 
 ```python
 # services/__init__.py
@@ -1358,7 +1358,7 @@ def _load_on_startup():
     sam3_adapter.load()
 ```
 
-- [ ] **Step 6: Create the HTTP client adapter**
+- [x] **Step 6: Create the HTTP client adapter**
 
 ```python
 # models/adapters/sam3_http_adapter.py
@@ -1485,7 +1485,7 @@ class SAM3HttpAdapter(BaseSegmenter):
         )
 ```
 
-- [ ] **Step 7: Wire backend selection into `backend/app.py`**
+- [x] **Step 7: Wire backend selection into `backend/app.py`**
 
 Replace `sam3_adapter = SAM3Adapter()` (around line 76) with:
 
@@ -1514,17 +1514,17 @@ sam3_adapter = _build_sam3_adapter()
 
 (`_verification_cfg` is already loaded earlier in `backend/app.py` via `_load_verification_pipeline_config()` — this function must be defined/called after that, matching its existing position in the file.)
 
-- [ ] **Step 8: Run tests to verify they pass**
+- [x] **Step 8: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_sam3_adapter.py tests/test_sam3_http_adapter.py -v`
 Expected: PASS (9 tests total).
 
-- [ ] **Step 9: Run the full existing test suite to confirm no regressions**
+- [x] **Step 9: Run the full existing test suite to confirm no regressions**
 
 Run: `python -m pytest tests/ -q`
 Expected: All previously-passing tests still pass (the `ModelInfo.backend` field addition is purely additive/optional).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add services/ models/adapters/sam3_http_adapter.py models/adapters/sam3_adapter.py models/adapters/base.py backend/app.py tests/test_sam3_adapter.py tests/test_sam3_http_adapter.py
@@ -1550,7 +1550,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `raw_outputs["timings"]` dict with keys `dino_ms`, `sam3_ms`, `geometry_ms`, `qwen_ms`, `obb_ms`, `total_ms` (all `float`, rounded to 1 decimal), present whenever `mode in ("AI_LABEL", "DINO_SAM")` and `verification_pipeline.logging.log_stage_timings` is true (default true).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_backend.py`:
 
@@ -1582,12 +1582,12 @@ def test_ai_label_pipeline_reports_stage_timings(self):
             self.assertIsInstance(timings[key], (int, float))
 ```
 
-- [ ] **Step 2: Run test to verify current behavior (informational — this test may already pass with a 503 on this machine)**
+- [x] **Step 2: Run test to verify current behavior (informational — this test may already pass with a 503 on this machine)**
 
 Run: `python -m pytest tests/test_backend.py::TestBackendAPI::test_ai_label_pipeline_reports_stage_timings -v`
 Expected on this machine: PASS trivially (the `if res.status_code == 200` guard skips the real assertion when DINO is unavailable here) — this test becomes meaningful on HAWK where DINO+SAM3 actually load. Proceed with implementation regardless, so the assertion is enforced once real inference runs.
 
-- [ ] **Step 3: Add timing instrumentation**
+- [x] **Step 3: Add timing instrumentation**
 
 In `backend/app.py`, add `import time` near the top if not already present, then wrap each stage in `run_ai_pipeline` (production path only, `mode in ("AI_LABEL", "DINO_SAM", "DINO_ONLY")`):
 
@@ -1648,12 +1648,12 @@ if (_verification_cfg.get("logging", {}) or {}).get("log_stage_timings", True):
     print(f"[timing] {filename or img_path.name}: {timings}")
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_backend.py -v`
 Expected: PASS (including the new timing test, trivially on this machine per Step 2's note).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/app.py tests/test_backend.py
@@ -1674,7 +1674,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `QwenVerifier.get_info()` now sets `name="Qwen3-VL-8B-Instruct"` + `backend="transformers"` + `device=<resolved>` when the transformers backend is active (Task 3); keeps the existing `"Qwen VLM Verifier (Ollama: ...)"` naming when Ollama is active; frontend model-status rows now render `m.backend` as a small secondary line under the status badge when present.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_backend.py`:
 
@@ -1692,12 +1692,12 @@ def test_qwen_model_status_reports_backend_field(self):
         self.assertIsNotNone(qwen_info["backend"])
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/test_backend.py::TestBackendAPI::test_qwen_model_status_reports_backend_field -v`
 Expected: FAIL — `"backend"` key not yet reliably set to one of the three literal values (currently `weights_path` encodes backend info as a string, not a clean `backend` field with those exact values).
 
-- [ ] **Step 3: Update `QwenVerifier.get_info()`**
+- [x] **Step 3: Update `QwenVerifier.get_info()`**
 
 ```python
 def get_info(self) -> ModelInfo:
@@ -1747,12 +1747,12 @@ def get_info(self) -> ModelInfo:
     )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_backend.py -v`
 Expected: PASS (all tests, including the new one).
 
-- [ ] **Step 5: Update frontend model-status row rendering**
+- [x] **Step 5: Update frontend model-status row rendering**
 
 In `frontend/app.js`, find the model-status row template (`row.innerHTML = ...` near the code that builds `elements.modelStatusList`, referenced earlier around status badge rendering) and add a backend line:
 
@@ -1774,7 +1774,7 @@ Add a small CSS rule in `frontend/style.css` (reusing existing `--text-muted` to
 }
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add models/adapters/qwen_adapter.py frontend/app.js frontend/style.css tests/test_backend.py
@@ -1798,7 +1798,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `DatasetManager.save_predictions(...)` writes an additional top-level `record["summary"]` key: `{"image": filename, "dino": [...], "sam3": [...], "geometry": [...], "qwen": [...], "obb": [...], "final_status": "needs_review"|"reviewed_clean"|"no_candidates"}` — purely additive; the existing `record["boxes"]`/`record["raw_outputs"]` (already relied on by `get_predictions`, the frontend, and existing tests) are unchanged.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_storage.py`:
 
@@ -1840,12 +1840,12 @@ def test_save_predictions_includes_spec_shaped_summary(self):
     self.assertIn("raw_outputs", record)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/test_storage.py::TestDatasetManager::test_save_predictions_includes_spec_shaped_summary -v`
 Expected: FAIL with `KeyError: 'summary'`.
 
-- [ ] **Step 3: Implement `_build_spec_summary` and call it from `save_predictions`**
+- [x] **Step 3: Implement `_build_spec_summary` and call it from `save_predictions`**
 
 In `backend/storage.py`, add a helper and call it inside `save_predictions` before writing `record`:
 
@@ -1913,12 +1913,12 @@ record = {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_storage.py -v`
 Expected: PASS (all tests, including the new one).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/storage.py tests/test_storage.py
@@ -1944,7 +1944,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `DatasetManager.mark_skipped(dataset_id: str, filename: str) -> None`, endpoint `POST /api/datasets/{dataset_id}/images/{filename}/skip`, frontend `skipCurrentAnnotation()` bound to a new `#btn-skip` button and the existing keyboard-shortcut dispatcher.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_backend.py`:
 
@@ -1973,12 +1973,12 @@ def test_skip_endpoint_marks_status_without_touching_predictions(self):
     self.assertEqual(len(pred["boxes"]), 1)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/test_backend.py::TestBackendAPI::test_skip_endpoint_marks_status_without_touching_predictions -v`
 Expected: FAIL with 404 (endpoint doesn't exist yet).
 
-- [ ] **Step 3: Add `mark_skipped` to `DatasetManager`**
+- [x] **Step 3: Add `mark_skipped` to `DatasetManager`**
 
 In `backend/storage.py`:
 
@@ -2004,7 +2004,7 @@ Add `skipped_count` to `_recount_stats`:
 meta["skipped_count"] = sum(1 for v in images.values() if v.get("status") == "skipped")
 ```
 
-- [ ] **Step 4: Add the endpoint**
+- [x] **Step 4: Add the endpoint**
 
 In `backend/app.py`, near the other per-image endpoints:
 
@@ -2015,12 +2015,12 @@ def skip_image_endpoint(dataset_id: str, filename: str):
     return {"status": "skipped", "filename": filename}
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_backend.py -v`
 Expected: PASS (all tests).
 
-- [ ] **Step 6: Wire the Skip button into the frontend**
+- [x] **Step 6: Wire the Skip button into the frontend**
 
 In `frontend/index.html`, add next to the existing Accept/Save Edits/Reject buttons:
 
@@ -2063,7 +2063,7 @@ Add the `K` keyboard shortcut in `handleKeyDown` next to the existing `A`/`R` ha
 
 Add a keyboard-shortcuts table row and minimal CSS reusing `.btn-secondary` (no new class needed).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add backend/storage.py backend/app.py frontend/index.html frontend/app.js tests/test_backend.py
@@ -2086,7 +2086,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `run_ai_pipeline` (from `backend/app.py`, unchanged signature), all adapters from Tasks 2-5.
 
-- [ ] **Step 1: Write the end-to-end test**
+- [x] **Step 1: Write the end-to-end test**
 
 ```python
 # tests/test_e2e_pipeline.py
@@ -2161,17 +2161,17 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the test**
+- [x] **Step 2: Run the test**
 
 Run: `python -m pytest tests/test_e2e_pipeline.py -v`
 Expected: PASS — on this machine via the `raw_outputs.get("error")` early-return branch (DINO unavailable, honestly reported); on HAWK, PASS via the full assertions once SAM3/Qwen3-VL-8B are actually loaded.
 
-- [ ] **Step 3: Run the entire test suite one final time**
+- [x] **Step 3: Run the entire test suite one final time**
 
 Run: `python -m pytest tests/ -q`
 Expected: All tests pass, including every test from Tasks 1-9.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/test_e2e_pipeline.py
