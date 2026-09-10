@@ -19,6 +19,7 @@ crop-building, prompt template, and response normalization.
 
 from __future__ import annotations
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,22 @@ from PIL import Image
 
 _SINGLETONS: Dict[str, "Qwen3VLTransformersBackend"] = {}
 _SINGLETON_LOCK = threading.Lock()
+
+_HUB_ID_RE = re.compile(r"[\w.-]+/[\w.-]+")
+
+
+def _looks_like_hub_id(model_path: str) -> bool:
+    """
+    True for a bare "Org/Repo"-shaped string (e.g. "Qwen/Qwen3-VL-8B-Instruct")
+    that should be resolved through transformers' own local Hugging Face Hub
+    cache lookup, rather than treated as a literal filesystem directory.
+    False for anything that looks like an actual path: starts with "/" or
+    "~" (Unix absolute/home-relative), contains a backslash (Windows), or
+    has more than one path segment (e.g. "C:/models/x", "a/b/c").
+    """
+    if not model_path or model_path.startswith(("/", "~")) or "\\" in model_path:
+        return False
+    return bool(_HUB_ID_RE.fullmatch(model_path))
 
 
 class Qwen3VLTransformersBackend:
@@ -72,12 +89,30 @@ class Qwen3VLTransformersBackend:
         if self.is_loaded():
             return True
         try:
-            if not self.model_path or not Path(self.model_path).exists():
+            if not self.model_path:
+                self._error = (
+                    "No Qwen3-VL-8B-Instruct model_path configured. Set "
+                    "verification_pipeline.qwen.transformers.model_path (or QWEN_MODEL_PATH) to "
+                    "either a local checkpoint directory or a Hugging Face Hub id "
+                    "(e.g. 'Qwen/Qwen3-VL-8B-Instruct') already cached locally."
+                )
+                return False
+
+            # A literal filesystem path is pre-checked for existence so a
+            # typo'd directory fails fast with a clear message before ever
+            # importing transformers. A bare "Org/Repo"-shaped string (e.g.
+            # "Qwen/Qwen3-VL-8B-Instruct") is a Hugging Face Hub id, not a
+            # real directory relative to the current working directory --
+            # Path(...).exists() would incorrectly reject a valid,
+            # already-cached Hub id, so that case skips straight to
+            # from_pretrained's own local-cache resolution below (still
+            # local_files_only=True, so it still never downloads).
+            if not _looks_like_hub_id(self.model_path) and not Path(self.model_path).exists():
                 self._error = (
                     f"Local Qwen3-VL-8B-Instruct path does not exist: '{self.model_path}'. "
                     "This backend never downloads from the Hub -- point "
                     "verification_pipeline.qwen.transformers.model_path (or QWEN_MODEL_PATH) "
-                    "at a local checkpoint directory."
+                    "at a local checkpoint directory, or a Hugging Face Hub id already cached locally."
                 )
                 return False
 

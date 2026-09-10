@@ -16,7 +16,34 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from models.adapters.qwen3vl_transformers_backend import Qwen3VLTransformersBackend
+from models.adapters.qwen3vl_transformers_backend import Qwen3VLTransformersBackend, _looks_like_hub_id
+
+
+class TestHubIdDetection(unittest.TestCase):
+    """Distinguishing a literal filesystem directory from a Hugging Face Hub
+    id (e.g. 'Qwen/Qwen3-VL-8B-Instruct', already cached locally under
+    ~/.cache/huggingface/hub/) matters because Path(...).exists() would
+    incorrectly reject a valid, already-cached Hub id -- it's not a real
+    directory relative to the current working directory."""
+
+    def test_hub_id_shaped_strings_are_detected(self):
+        self.assertTrue(_looks_like_hub_id("Qwen/Qwen3-VL-8B-Instruct"))
+        self.assertTrue(_looks_like_hub_id("meta-llama/Llama-3.1-8B"))
+
+    def test_absolute_unix_path_is_not_a_hub_id(self):
+        self.assertFalse(_looks_like_hub_id("/home/maska/models/Qwen3-VL-8B-Instruct"))
+
+    def test_home_relative_path_is_not_a_hub_id(self):
+        self.assertFalse(_looks_like_hub_id("~/models/Qwen3-VL-8B-Instruct"))
+
+    def test_multi_segment_path_is_not_a_hub_id(self):
+        self.assertFalse(_looks_like_hub_id("C:/models/Qwen3-VL-8B-Instruct"))
+
+    def test_windows_backslash_path_is_not_a_hub_id(self):
+        self.assertFalse(_looks_like_hub_id(r"C:\models\Qwen3-VL-8B-Instruct"))
+
+    def test_empty_string_is_not_a_hub_id(self):
+        self.assertFalse(_looks_like_hub_id(""))
 
 
 class TestQwen3VLTransformersBackend(unittest.TestCase):
@@ -63,6 +90,19 @@ class TestQwen3VLTransformersBackend(unittest.TestCase):
         backend.load()
         backend.unload()
         self.assertFalse(backend.is_loaded())
+
+    def test_hub_id_not_cached_here_fails_via_from_pretrained_not_path_precheck(self):
+        # A Hub-id-shaped model_path must NOT be rejected by the fast
+        # Path.exists() pre-check (it isn't a real directory) -- it should
+        # reach transformers' own from_pretrained(local_files_only=True),
+        # which fails honestly here since this machine has no local HF cache
+        # entry for it. The resulting error must come from that call, not
+        # from our own "path does not exist" pre-check message.
+        backend = Qwen3VLTransformersBackend(model_path="Qwen/Qwen3-VL-8B-Instruct-not-a-real-cached-repo")
+        ok = backend.load()
+        self.assertFalse(ok)
+        error = backend.get_status()["error"] or ""
+        self.assertNotIn("does not exist", error)
 
 
 if __name__ == "__main__":
