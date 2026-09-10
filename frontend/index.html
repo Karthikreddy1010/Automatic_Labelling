@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=2">
+  <link rel="stylesheet" href="style.css?v=6">
 </head>
 <body class="dark-theme">
   <!-- Top Navigation Bar -->
@@ -182,6 +182,10 @@
           <button id="btn-reject" class="btn btn-danger btn-sm" title="Reject Candidate (False Positive)">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
             Reject
+          </button>
+          <button id="btn-skip" class="btn btn-outline btn-sm" title="Skip -- Uncertain, Keep For Later Review (K)">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="5" x2="19" y2="19"></line></svg>
+            Skip
           </button>
           <button id="btn-remove-all-labels" class="btn btn-outline btn-sm btn-outline-danger" title="Remove All Labels From This Image">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
@@ -460,21 +464,44 @@
 
   <!-- Import Modal -->
   <div id="import-modal" class="modal-overlay hidden">
-    <div class="modal-card">
+    <div class="modal-card modal-card-wide">
       <div class="modal-header">
         <h2>Import Images to Dataset</h2>
         <button id="btn-close-import-modal" class="modal-close-btn">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-group">
-          <label for="import-source-path">Local Directory Path:</label>
-          <input type="text" id="import-source-path" class="styled-input" placeholder="e.g. C:\Users\dukar\OneDrive\Desktop\auto_annotation\img1">
-          <small class="helper-text">Supports JPG, PNG, WEBP, BMP. Images are copied into data/datasets/&lt;id&gt;/images/.</small>
+        <div id="import-dropzone" class="import-dropzone">
+          <p>Drag &amp; drop images or a folder here</p>
+          <div class="import-dropzone-actions">
+            <button id="btn-browse-folder" class="btn btn-secondary" type="button">Choose Folder...</button>
+            <button id="btn-browse-files" class="btn btn-secondary" type="button">Choose Files...</button>
+          </div>
+          <small class="helper-text">Supports JPG, PNG, WEBP, BMP. Opens your OS file picker -- no path typing needed.</small>
         </div>
+        <input type="file" id="import-folder-input" webkitdirectory directory multiple hidden>
+        <input type="file" id="import-files-input" multiple accept="image/jpeg,image/png,image/webp,image/bmp" hidden>
+
+        <div id="import-staging" class="import-staging hidden">
+          <div class="import-staging-header">
+            <span id="import-staging-count">0 images ready</span>
+            <button id="btn-clear-staging" class="btn-link" type="button">Clear all</button>
+          </div>
+          <div id="import-thumb-grid" class="import-thumb-grid"></div>
+        </div>
+
+        <details class="import-advanced">
+          <summary>Or paste a local directory path</summary>
+          <div class="form-group">
+            <label for="import-source-path">Local Directory Path:</label>
+            <input type="text" id="import-source-path" class="styled-input" placeholder="e.g. C:\Users\dukar\OneDrive\Desktop\auto_annotation\img1">
+            <small class="helper-text">Images are copied into data/datasets/&lt;id&gt;/images/.</small>
+          </div>
+          <button id="btn-run-import" class="btn btn-primary">Import from Path</button>
+        </details>
       </div>
       <div class="modal-footer">
-        <button id="btn-run-import" class="btn btn-primary">Import Images</button>
         <button id="btn-cancel-import" class="btn btn-secondary">Close</button>
+        <button id="btn-start-upload" class="btn btn-primary" disabled>Import 0 Images</button>
       </div>
     </div>
   </div>
@@ -490,6 +517,7 @@
         <table class="shortcuts-table">
           <tr><td><kbd>A</kbd></td><td>Accept annotation as ground truth</td></tr>
           <tr><td><kbd>R</kbd></td><td>Reject image (false positive)</td></tr>
+          <tr><td><kbd>K</kbd></td><td>Skip (uncertain, keep for later review)</td></tr>
           <tr><td><kbd>Space</kbd> / <kbd>Enter</kbd></td><td>Save human edits and advance</td></tr>
           <tr><td><kbd>Q</kbd></td><td>Next difficult image (Active Learning)</td></tr>
           <tr><td><kbd>S</kbd></td><td>Refine active box with SAM segmentation</td></tr>
@@ -544,6 +572,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=2"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>

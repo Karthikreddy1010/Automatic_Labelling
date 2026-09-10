@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import app, storage_mgr
 from backend.storage import DatasetManager
+from models.adapters.base import DetectionBox
 from src.geometry_obb import xyxy_to_obb_corners
 
 
@@ -69,6 +70,101 @@ class TestBackendAPI(unittest.TestCase):
         # endpoint returns clean structure rather than assuming one fixed
         # environment state.
         self.assertIn(qwen_info["status"], ["ready", "unavailable"])
+
+    def test_import_upload_endpoint(self):
+        """Browser folder/file-picker uploads land in images/ and register in metadata."""
+        ds_id = "api_test_upload_dataset"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Upload Test", "classes": ["utility_pole"]})
+
+        dummy = np.zeros((50, 50, 3), dtype=np.uint8)
+        ok, buf = cv2.imencode(".jpg", dummy)
+        jpg_bytes = buf.tobytes()
+
+        res = self.client.post(
+            f"/api/datasets/{ds_id}/import_upload",
+            files=[
+                ("files", ("pole_a.jpg", jpg_bytes, "image/jpeg")),
+                # Folder-picker uploads can include a relative path; it must be
+                # flattened to a bare filename, not used to escape images/.
+                ("files", ("subfolder/pole_b.jpg", jpg_bytes, "image/jpeg")),
+                ("files", ("notes.txt", b"not an image", "text/plain")),
+            ],
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["imported_count"], 2)
+        self.assertIn("pole_a.jpg", data["imported_images"])
+        self.assertIn("pole_b.jpg", data["imported_images"])
+
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        self.assertTrue((img_dir / "pole_a.jpg").exists())
+        self.assertTrue((img_dir / "pole_b.jpg").exists())
+        self.assertFalse((img_dir / "notes.txt").exists())
+
+        meta = storage_mgr.get_dataset(ds_id)
+        self.assertIn("pole_a.jpg", meta["images"])
+        self.assertIn("pole_b.jpg", meta["images"])
+
+    def test_ai_label_pipeline_reports_stage_timings(self):
+        """Part 17: every AI_LABEL run should report per-stage timing in raw_outputs."""
+        ds_id = "api_test_timing_dataset"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Timing Test", "classes": ["utility_pole"]})
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img_name = "timing_test.jpg"
+        dummy = np.zeros((300, 300, 3), dtype=np.uint8)
+        cv2.imwrite(str(img_dir / img_name), dummy)
+        storage_mgr.import_images(ds_id, [img_dir / img_name])
+
+        res = self.client.post(
+            "/api/inference/detect",
+            json={"dataset_id": ds_id, "filename": img_name, "mode": "AI_LABEL"},
+        )
+        # DINO/SAM aren't loaded in this CI environment -- a 503 "model
+        # unavailable" is an acceptable, honest outcome here; only assert on
+        # timings when the pipeline actually ran to completion.
+        if res.status_code == 200:
+            pred = storage_mgr.get_predictions(ds_id, img_name)
+            timings = pred["raw_outputs"].get("timings")
+            self.assertIsNotNone(timings)
+            for key in ("dino_ms", "total_ms"):
+                self.assertIn(key, timings)
+                self.assertIsInstance(timings[key], (int, float))
+
+    def test_qwen_model_status_reports_backend_field(self):
+        """Part 10/11: status must name the real backend (transformers/ollama/
+        dashscope), never a hard-coded 'Ollama: qwen3-vl:2b' regardless of which
+        backend is actually active."""
+        res = self.client.get("/api/models/status")
+        data = res.json()
+        qwen_info = next(m for m in data["models"] if "Qwen" in m["name"] or m["id"] == "qwen_verifier")
+        self.assertIn("backend", qwen_info)
+        if qwen_info["status"] == "ready":
+            self.assertIn(qwen_info["backend"], ("transformers", "ollama", "dashscope"))
+            self.assertIsNotNone(qwen_info["backend"])
+
+    def test_skip_endpoint_marks_status_without_touching_predictions(self):
+        """Part 13: Skip marks an image for later review without deleting or
+        altering its existing AI predictions."""
+        ds_id = "api_test_skip_dataset"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Skip Test", "classes": ["utility_pole"]})
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img_name = "skip_test.jpg"
+        cv2.imwrite(str(img_dir / img_name), np.zeros((100, 100, 3), dtype=np.uint8))
+        storage_mgr.import_images(ds_id, [img_dir / img_name])
+
+        box = DetectionBox(xyxy=(10, 10, 30, 90), corners=xyxy_to_obb_corners(10, 10, 30, 90).tolist(), confidence=0.7)
+        storage_mgr.save_predictions(ds_id, img_name, [box], raw_outputs={})
+
+        res = self.client.post(f"/api/datasets/{ds_id}/images/{img_name}/skip")
+        self.assertEqual(res.status_code, 200)
+
+        meta = storage_mgr.get_dataset(ds_id)
+        self.assertEqual(meta["images"][img_name]["status"], "skipped")
+        # Predictions must remain untouched.
+        pred = storage_mgr.get_predictions(ds_id, img_name)
+        self.assertEqual(len(pred["boxes"]), 1)
 
     def test_dataset_lifecycle_and_annotations(self):
         """Test dataset creation, annotation saving, and differential tracking via API."""

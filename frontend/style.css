@@ -751,6 +751,11 @@ body {
 .m-badge.standby { background: rgba(56, 139, 253, 0.2); color: #58a6ff; }
 .m-badge.missing_weights { background: rgba(210, 153, 34, 0.2); color: var(--color-yellow); }
 .m-badge.unavailable { background: rgba(248, 81, 73, 0.2); color: var(--color-red); }
+.model-backend {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin-left: 6px;
+}
 
 /* Modals */
 .modal-overlay {
@@ -772,10 +777,14 @@ body {
   border-radius: var(--radius-lg);
   width: 480px;
   max-width: 90vw;
+  max-height: 85vh;
   box-shadow: var(--shadow-panel);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.modal-card-wide {
+  width: 680px;
 }
 .modal-header {
   padding: 14px 18px;
@@ -800,6 +809,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  overflow-y: auto;
+  min-height: 0;
 }
 .modal-footer {
   padding: 12px 18px;
@@ -818,6 +829,177 @@ body {
 .helper-text {
   color: var(--text-muted);
   font-size: 0.75rem;
+}
+
+/* Import Modal: folder/file picker + drag-and-drop */
+.import-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 28px 18px;
+  text-align: center;
+  border: 2px dashed var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-dark);
+  transition: border-color 0.15s, background 0.15s;
+}
+.import-dropzone p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+.import-dropzone.dragging {
+  border-color: var(--color-accent);
+  background: rgba(var(--color-accent-rgb), 0.08);
+}
+.import-dropzone-actions {
+  display: flex;
+  gap: 10px;
+}
+/* Import Modal: staged thumbnail grid (Roboflow-style) */
+.import-staging-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--color-accent);
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0;
+}
+.btn-link:hover {
+  color: var(--color-accent-hover);
+  text-decoration: underline;
+}
+.btn-link:disabled {
+  color: var(--text-muted);
+  cursor: default;
+  text-decoration: none;
+}
+.import-thumb-grid {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 10px;
+  padding: 2px;
+}
+.import-thumb {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 2px solid var(--border-subtle);
+  background: var(--bg-dark);
+  transition: border-color 0.15s;
+}
+.import-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.import-thumb .thumb-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 3px 5px;
+  font-size: 0.65rem;
+  color: var(--text-primary);
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.85), transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.import-thumb .thumb-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 18px;
+  height: 18px;
+  line-height: 16px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0;
+}
+.import-thumb .thumb-remove:hover {
+  background: var(--color-red);
+}
+.import-thumb .thumb-status {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: none;
+}
+.import-thumb.state-uploading {
+  border-color: var(--color-accent);
+}
+.import-thumb.state-uploading .thumb-status {
+  display: block;
+  border: 2px solid rgba(var(--color-accent-rgb), 0.35);
+  border-top-color: var(--color-accent);
+  animation: spin 0.7s linear infinite;
+}
+.import-thumb.state-uploading .thumb-remove {
+  display: none;
+}
+.import-thumb.state-done {
+  border-color: var(--color-green);
+}
+.import-thumb.state-done .thumb-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-green);
+  color: #fff;
+  font-size: 0.65rem;
+}
+.import-thumb.state-done .thumb-status::after {
+  content: '\2713';
+}
+.import-thumb.state-done .thumb-remove {
+  display: none;
+}
+.import-thumb.state-error {
+  border-color: var(--color-red);
+}
+.import-thumb.state-error .thumb-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-red);
+  color: #fff;
+  font-size: 0.7rem;
+}
+.import-thumb.state-error .thumb-status::after {
+  content: '\2715';
+}
+.import-advanced {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.import-advanced summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.import-advanced .form-group {
+  margin-top: 10px;
+}
+.import-advanced #btn-run-import {
+  margin-top: 10px;
 }
 
 /* Batch Modal Progress */

@@ -182,9 +182,22 @@ class SAM3Adapter(BaseSegmenter):
         box_xyxy: Tuple[float, float, float, float]
     ) -> Optional[np.ndarray]:
         """
-        Extract cropped region for box-prompted segmentation using SAM 3.
+        Part 1: SAM3 should refine/segment the CANDIDATE REGION a proposer (DINO)
+        already found, not just trust a text prompt in isolation. Tries native
+        box-prompted segmentation first (image + input_boxes, same calling
+        convention as the SAM2 family this repo already uses in sam21_adapter.py)
+        -- falls back to the existing crop-and-text-prompt approach if the
+        installed Sam3Processor doesn't accept input_boxes (API differences
+        across transformers versions), so this never hard-depends on an exact
+        signature this session couldn't verify against a live HAWK install.
         """
-        # SAM3 primarily uses text prompts, but can segment within a box ROI
+        if self.model is None or self.proc is None:
+            ok = self.load(self.device)
+            if not ok:
+                return None
+
+        import torch
+
         if isinstance(image, (str, Path)):
             pil_img = Image.open(str(image)).convert("RGB")
         elif isinstance(image, np.ndarray):
@@ -195,7 +208,27 @@ class SAM3Adapter(BaseSegmenter):
         else:
             return None
 
-        # Crop to box with padding
+        try:
+            inp = self.proc(
+                images=pil_img,
+                input_boxes=[[list(box_xyxy)]],
+                return_tensors="pt",
+            ).to(torch.device(self.device))
+            with torch.no_grad():
+                out = self.model(**inp)
+            masks = self.proc.post_process_masks(
+                out.pred_masks, inp.get("original_sizes"), inp.get("reshaped_input_sizes"),
+            )
+            if masks and len(masks) > 0 and masks[0].numel() > 0:
+                m = masks[0][0]
+                m = m.cpu().numpy() if hasattr(m, "cpu") else np.asarray(m)
+                if m.ndim == 3:
+                    m = m[0]
+                return _clean((m > 0).astype(np.uint8), box_xyxy)
+        except Exception:
+            pass  # native box-prompting unsupported/failed -- fall back below
+
+        # --- Fallback: crop to the box (padded) and re-run text-prompted detection ---
         w, h = pil_img.size
         x0, y0, x1, y1 = box_xyxy
         pad_w = 0.1 * (x1 - x0)
@@ -233,9 +266,13 @@ class SAM3Adapter(BaseSegmenter):
             status=self._status,
             weights_path=self.model_id,
             device=self.device,
+            backend="sam3_inprocess",
             error_message=self._error_msg,
             installation_guide=(
-                f"Requires Hugging Face model '{self.model_id}'. "
-                "Ensure transformers library supports SAM 3. Set POLE_ALLOW_ONLINE=1 to download."
+                f"Requires Hugging Face model '{self.model_id}' with transformers>=5.9 "
+                "(Sam3Processor/Sam3Model). If this app's environment can't upgrade "
+                "transformers safely, run services/sam3_service.py in a separate "
+                "environment instead and set verification_pipeline.sam3.backend=http. "
+                "Set POLE_ALLOW_ONLINE=1 to download."
             ),
         )

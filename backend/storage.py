@@ -305,6 +305,37 @@ class DatasetManager:
                     shutil.copy2(path_obj, target)
                 imported.append(path_obj.name)
 
+        self._register_imported_images(dataset_id, imported)
+        return imported
+
+    def import_uploaded_files(self, dataset_id: str, files: List[Tuple[str, bytes]]) -> List[str]:
+        """
+        Import image files uploaded via the browser (filename, raw bytes) into
+        the dataset images/ directory and update metadata. Used by the
+        folder/file-picker upload flow, as an alternative to import_images()'s
+        server-local directory path.
+        """
+        ds_path = self.base_dir / dataset_id
+        img_dir = ds_path / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        imported: List[str] = []
+
+        for raw_name, content in files:
+            # Browser folder uploads may send a relative path (e.g. "sub/img.jpg");
+            # flatten to a bare, sanitized filename before touching the filesystem.
+            name = _safe_component(Path(raw_name).name)
+            if not name or Path(name).suffix.lower() not in VALID_IMAGE_EXTENSIONS:
+                continue
+            target = img_dir / name
+            if not target.exists():
+                target.write_bytes(content)
+            imported.append(name)
+
+        self._register_imported_images(dataset_id, imported)
+        return imported
+
+    def _register_imported_images(self, dataset_id: str, imported: List[str]) -> None:
+        ds_path = self.base_dir / dataset_id
         with self._lock_for(dataset_id):
             meta = self.get_dataset(dataset_id)
             if not meta:
@@ -336,7 +367,6 @@ class DatasetManager:
 
             self._recount_stats(meta)
             self._update_metadata(dataset_id, meta)
-        return imported
 
     def _recount_stats(self, meta: Dict[str, Any]) -> None:
         images = meta.get("images", {})
@@ -352,7 +382,22 @@ class DatasetManager:
         meta["auto_pass_count"] = sum(1 for v in images.values() if v.get("status") == "auto_pass")
         meta["ai_suggested_count"] = sum(1 for v in images.values() if v.get("status") == "ai_suggested")
         meta["unlabeled_count"] = sum(1 for v in images.values() if v.get("status") == "unlabeled")
+        meta["skipped_count"] = sum(1 for v in images.values() if v.get("status") == "skipped")
         meta["needs_review_count"] = sum(1 for v in images.values() if v.get("needs_review"))
+
+    def mark_skipped(self, dataset_id: str, filename: str) -> None:
+        """Part 13: mark an image as skipped (uncertain, deferred for later
+        review) without touching its predictions/annotations -- a distinct
+        status from unlabeled/verified/rejected so the review queue can filter
+        on it separately."""
+        with self._lock_for(dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if not meta or filename not in meta.get("images", {}):
+                return
+            meta["images"][filename]["status"] = "skipped"
+            meta["images"][filename]["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._recount_stats(meta)
+            self._update_metadata(dataset_id, meta)
 
     def get_image_path(self, dataset_id: str, filename: str) -> Optional[Path]:
         safe_id = _safe_component(dataset_id)
@@ -386,6 +431,54 @@ class DatasetManager:
 
     # --- RAW PREDICTIONS (NEVER OVERWRITTEN BY HUMAN EDITS) ---
 
+    def _build_spec_summary(self, filename: str, boxes: List[DetectionBox], raw_outputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Part 12: a flat, spec-shaped view of the same information already in
+        `boxes`/`raw_outputs` -- derived at save time, not a second source of
+        truth. `boxes` (with per-candidate .attributes) remains authoritative;
+        this is purely a convenience projection for consumers that expect the
+        literal dino/sam3/geometry/qwen/obb/final_status shape from the spec.
+        """
+        geometry_entries, qwen_entries, obb_entries = [], [], []
+        any_needs_review = False
+        for b in boxes:
+            attrs = b.attributes or {}
+            any_needs_review = any_needs_review or b.needs_review
+            geometry_entries.append({
+                "geometry_score": attrs.get("geometry_score"),
+                "geometry_status": attrs.get("geometry_status"),
+                "geometry_flags": attrs.get("geometry_flags", []),
+            })
+            qwen_entries.append({
+                "ran": attrs.get("qwen_ran", False),
+                "class": attrs.get("qwen_class"),
+                "material": attrs.get("qwen_material"),
+                "visibility": attrs.get("qwen_visibility"),
+                "semantic_confidence": attrs.get("qwen_semantic_confidence"),
+                "reason": attrs.get("qwen_reason"),
+            })
+            obb_entries.append({
+                "corners": b.corners,
+                "source": attrs.get("obb_source"),
+            })
+
+        if not boxes:
+            final_status = "no_candidates"
+        elif any_needs_review:
+            final_status = "needs_review"
+        else:
+            final_status = "reviewed_clean"
+
+        return {
+            "image": filename,
+            "dino": raw_outputs.get("dino", []),
+            "sam3": raw_outputs.get("sam3_candidates", raw_outputs.get("sam3", [])),
+            "geometry": geometry_entries,
+            "qwen": qwen_entries,
+            "obb": obb_entries,
+            "final_status": final_status,
+        }
+
     def save_predictions(
         self,
         dataset_id: str,
@@ -399,7 +492,7 @@ class DatasetManager:
         """
         stem = Path(filename).stem
         pred_path = self.base_dir / dataset_id / "predictions" / f"{stem}.json"
-        
+
         record = {
             "dataset_id": dataset_id,
             "filename": filename,
@@ -407,6 +500,7 @@ class DatasetManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "boxes": [b.to_dict() for b in boxes],
             "raw_outputs": raw_outputs or {},
+            "summary": self._build_spec_summary(filename, boxes, raw_outputs or {}),
         }
         pred_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 

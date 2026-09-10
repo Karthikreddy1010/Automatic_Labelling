@@ -65,6 +65,10 @@ const state = {
   history: [],
   historyIndex: -1,
   isDirty: false,
+
+  // Import modal staging queue: [{ id, file, url, status: 'pending'|'uploading'|'done'|'error', el }]
+  importQueue: [],
+  importUploading: false,
 };
 
 // --- DOM ELEMENTS ---
@@ -114,6 +118,7 @@ const elements = {
   btnAcceptVerify: document.getElementById('btn-accept-verify'),
   btnAccept: document.getElementById('btn-accept'),
   btnReject: document.getElementById('btn-reject'),
+  btnSkip: document.getElementById('btn-skip'),
   btnRemoveAllLabels: document.getElementById('btn-remove-all-labels'),
   btnNextDifficult: document.getElementById('btn-next-difficult'),
 
@@ -225,7 +230,17 @@ const elements = {
   importSourcePath: document.getElementById('import-source-path'),
   btnRunImport: document.getElementById('btn-run-import'),
   btnCancelImport: document.getElementById('btn-cancel-import'),
-  
+  importDropzone: document.getElementById('import-dropzone'),
+  importFolderInput: document.getElementById('import-folder-input'),
+  importFilesInput: document.getElementById('import-files-input'),
+  btnBrowseFolder: document.getElementById('btn-browse-folder'),
+  btnBrowseFiles: document.getElementById('btn-browse-files'),
+  importStaging: document.getElementById('import-staging'),
+  importStagingCount: document.getElementById('import-staging-count'),
+  btnClearStaging: document.getElementById('btn-clear-staging'),
+  importThumbGrid: document.getElementById('import-thumb-grid'),
+  btnStartUpload: document.getElementById('btn-start-upload'),
+
   shortcutsModal: document.getElementById('shortcuts-modal'),
   btnCloseShortcutsModal: document.getElementById('btn-close-shortcuts-modal'),
 };
@@ -359,7 +374,7 @@ async function fetchModelStatus() {
       }
       
       row.innerHTML = `
-        <span class="m-name">${m.name}</span>
+        <span class="m-name">${m.name}${m.backend ? `<span class="model-backend">${m.backend}${m.device && m.device !== 'cpu' ? ' · ' + m.device : ''}</span>` : ''}</span>
         <span class="m-badge ${badgeClass}" style="cursor: pointer;" title="Status: ${m.status}. Click to pre-load into memory.">${labelText}</span>
       `;
       
@@ -899,6 +914,7 @@ function setupEventListeners() {
   // Accept / Reject / Next Difficult
   elements.btnAccept.addEventListener('click', acceptCurrentAnnotation);
   elements.btnReject.addEventListener('click', rejectCurrentAnnotation);
+  elements.btnSkip.addEventListener('click', skipCurrentAnnotation);
   elements.btnNextDifficult.addEventListener('click', loadNextDifficultImage);
   
   // Active Learning Controls
@@ -968,10 +984,38 @@ function setupEventListeners() {
   elements.btnCancelBatch.addEventListener('click', () => fetch(API_BASE + 'api/batch/cancel', { method: 'POST' }));
   
   elements.btnImportImages.addEventListener('click', () => elements.importModal.classList.remove('hidden'));
-  elements.btnCloseImportModal.addEventListener('click', () => elements.importModal.classList.add('hidden'));
-  elements.btnCancelImport.addEventListener('click', () => elements.importModal.classList.add('hidden'));
+  elements.btnCloseImportModal.addEventListener('click', closeImportModal);
+  elements.btnCancelImport.addEventListener('click', closeImportModal);
   elements.btnRunImport.addEventListener('click', runImageImport);
-  
+
+  elements.btnBrowseFolder.addEventListener('click', () => elements.importFolderInput.click());
+  elements.btnBrowseFiles.addEventListener('click', () => elements.importFilesInput.click());
+  elements.importFolderInput.addEventListener('change', (e) => {
+    addFilesToStagingQueue(e.target.files);
+    e.target.value = '';
+  });
+  elements.importFilesInput.addEventListener('change', (e) => {
+    addFilesToStagingQueue(e.target.files);
+    e.target.value = '';
+  });
+  ['dragenter', 'dragover'].forEach(evt =>
+    elements.importDropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      elements.importDropzone.classList.add('dragging');
+    })
+  );
+  ['dragleave', 'drop'].forEach(evt =>
+    elements.importDropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      elements.importDropzone.classList.remove('dragging');
+    })
+  );
+  elements.importDropzone.addEventListener('drop', (e) => {
+    if (e.dataTransfer.files.length) addFilesToStagingQueue(e.dataTransfer.files);
+  });
+  elements.btnClearStaging.addEventListener('click', clearStagingQueue);
+  elements.btnStartUpload.addEventListener('click', startStagedUpload);
+
   elements.btnShortcuts.addEventListener('click', () => elements.shortcutsModal.classList.toggle('hidden'));
   elements.btnCloseShortcutsModal.addEventListener('click', () => elements.shortcutsModal.classList.add('hidden'));
   
@@ -1914,6 +1958,26 @@ async function confirmRejectCurrent() {
 }
 
 /**
+ * Skip: uncertain candidate, keep for later review. Marks the image's
+ * status distinctly (not unlabeled/verified/rejected) without touching its
+ * existing predictions/annotations, then advances to the next image.
+ */
+async function skipCurrentAnnotation() {
+  if (!state.activeImageMeta) return;
+  try {
+    await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/skip`, {
+      method: 'POST',
+    });
+  } catch (err) {
+    console.error('Skip failed:', err);
+  }
+  await loadDatasetImages(state.activeDatasetId);
+  if (state.activeImageIndex < state.images.length - 1) {
+    selectImage(state.activeImageIndex + 1);
+  }
+}
+
+/**
  * Toggle fixed test set membership for current image.
  */
 async function toggleTestSetCurrent() {
@@ -2253,6 +2317,173 @@ async function runImageImport() {
   }
 }
 
+const VALID_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.bmp'];
+const IMPORT_UPLOAD_CONCURRENCY = 4;
+let importQueueSeq = 0;
+
+// Roboflow-style staged upload: files land in a thumbnail grid immediately
+// (local preview only, nothing sent yet); "Import N Images" then uploads
+// them with per-thumbnail progress, so the user can review/remove first.
+function addFilesToStagingQueue(fileList) {
+  const existingKeys = new Set(state.importQueue.map(item => `${item.file.name}:${item.file.size}`));
+  const files = Array.from(fileList).filter(f =>
+    VALID_IMAGE_EXTENSIONS.some(ext => f.name.toLowerCase().endsWith(ext)) &&
+    !existingKeys.has(`${f.name}:${f.size}`)
+  );
+  if (!files.length) return;
+
+  files.forEach(file => {
+    const item = { id: ++importQueueSeq, file, url: URL.createObjectURL(file), status: 'pending', el: null };
+    state.importQueue.push(item);
+    renderImportThumb(item);
+  });
+  elements.importStaging.classList.remove('hidden');
+  updateStagingHeader();
+}
+
+function renderImportThumb(item) {
+  const card = document.createElement('div');
+  card.className = 'import-thumb state-pending';
+
+  const img = document.createElement('img');
+  img.src = item.url;
+  img.alt = item.file.name;
+  card.appendChild(img);
+
+  const badge = document.createElement('div');
+  badge.className = 'thumb-status';
+  card.appendChild(badge);
+
+  const remove = document.createElement('button');
+  remove.className = 'thumb-remove';
+  remove.type = 'button';
+  remove.title = 'Remove';
+  remove.textContent = '×';
+  remove.addEventListener('click', () => removeFromStagingQueue(item.id));
+  card.appendChild(remove);
+
+  const label = document.createElement('div');
+  label.className = 'thumb-name';
+  label.textContent = item.file.name;
+  label.title = item.file.name;
+  card.appendChild(label);
+
+  item.el = card;
+  elements.importThumbGrid.appendChild(card);
+}
+
+function removeFromStagingQueue(id) {
+  const idx = state.importQueue.findIndex(item => item.id === id);
+  if (idx === -1) return;
+  const [item] = state.importQueue.splice(idx, 1);
+  URL.revokeObjectURL(item.url);
+  item.el?.remove();
+  if (!state.importQueue.length) elements.importStaging.classList.add('hidden');
+  updateStagingHeader();
+}
+
+function clearStagingQueue() {
+  state.importQueue.forEach(item => URL.revokeObjectURL(item.url));
+  state.importQueue = [];
+  elements.importThumbGrid.innerHTML = '';
+  elements.importStaging.classList.add('hidden');
+  updateStagingHeader();
+}
+
+function updateStagingHeader() {
+  const n = state.importQueue.length;
+  elements.importStagingCount.textContent = `${n} image${n === 1 ? '' : 's'} ready`;
+  elements.btnStartUpload.textContent = `Import ${n} Image${n === 1 ? '' : 's'}`;
+  elements.btnStartUpload.disabled = n === 0 || state.importUploading;
+}
+
+function closeImportModal() {
+  if (state.importUploading) return;
+  elements.importModal.classList.add('hidden');
+  clearStagingQueue();
+}
+
+async function uploadOneStagedFile(item) {
+  item.status = 'uploading';
+  item.el.className = 'import-thumb state-uploading';
+  try {
+    const formData = new FormData();
+    formData.append('files', item.file, item.file.name);
+    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/import_upload`, {
+      method: 'POST',
+      body: formData
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.imported_count) throw new Error('not imported');
+    item.status = 'done';
+    item.el.className = 'import-thumb state-done';
+  } catch (err) {
+    item.status = 'error';
+    item.el.className = 'import-thumb state-error';
+    item.el.title = `Failed: ${err.message}`;
+  }
+}
+
+async function runWithConcurrency(items, worker, concurrency) {
+  let next = 0;
+  async function lane() {
+    while (next < items.length) {
+      const item = items[next++];
+      await worker(item);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, lane));
+}
+
+async function startStagedUpload() {
+  const pending = state.importQueue.filter(item => item.status === 'pending' || item.status === 'error');
+  if (!pending.length || !state.activeDatasetId) return;
+
+  state.importUploading = true;
+  elements.btnStartUpload.disabled = true;
+  elements.btnClearStaging.disabled = true;
+  elements.btnCancelImport.disabled = true;
+
+  let done = 0;
+  const updateProgress = () => {
+    done++;
+    elements.importStagingCount.textContent = `Uploading ${done} / ${pending.length}...`;
+  };
+
+  await runWithConcurrency(pending, async (item) => {
+    await uploadOneStagedFile(item);
+    updateProgress();
+  }, IMPORT_UPLOAD_CONCURRENCY);
+
+  const failed = state.importQueue.filter(item => item.status === 'error').length;
+  const succeeded = state.importQueue.length - failed;
+  elements.importStagingCount.textContent = failed
+    ? `Imported ${succeeded}, ${failed} failed -- click Import to retry failed`
+    : `Imported ${succeeded} image${succeeded === 1 ? '' : 's'}.`;
+
+  state.importUploading = false;
+  elements.btnClearStaging.disabled = false;
+  elements.btnCancelImport.disabled = false;
+  // Set button state directly (not via updateStagingHeader()) so the
+  // "Imported N images." / "N failed" summary above stays visible instead
+  // of being immediately clobbered back to "N images ready".
+  if (failed) {
+    elements.btnStartUpload.disabled = false;
+    elements.btnStartUpload.textContent = 'Retry Failed';
+  } else {
+    const n = state.importQueue.length;
+    elements.btnStartUpload.disabled = true;
+    elements.btnStartUpload.textContent = `Import ${n} Image${n === 1 ? '' : 's'}`;
+  }
+
+  await loadDatasetImages(state.activeDatasetId);
+
+  if (!failed) {
+    setTimeout(() => closeImportModal(), 900);
+  }
+}
+
 // --- KEYBOARD SHORTCUTS ---
 
 function handleKeyDown(e) {
@@ -2277,6 +2508,9 @@ function handleKeyDown(e) {
   } else if (e.key === 'r' || e.key === 'R') {
     e.preventDefault();
     rejectCurrentAnnotation();
+  } else if (e.key === 'k' || e.key === 'K') {
+    e.preventDefault();
+    skipCurrentAnnotation();
   } else if (e.key === ' ' || e.key === 'Enter') {
     e.preventDefault();
     saveEditsCurrentAnnotation();

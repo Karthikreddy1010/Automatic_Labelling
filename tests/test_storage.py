@@ -168,6 +168,42 @@ class TestStorageAndDifferential(unittest.TestCase):
         preds2 = self.mgr.get_predictions(self.ds_id, self.img_name)
         self.assertEqual(len(preds2["boxes"]), 1)
 
+    def test_save_predictions_includes_spec_shaped_summary(self):
+        """Part 12: predictions.json additionally exposes a flat per-stage
+        summary (dino/sam3/geometry/qwen/obb/final_status) alongside the
+        existing boxes/raw_outputs structure, without changing either."""
+        box = DetectionBox(
+            xyxy=(10.0, 10.0, 30.0, 90.0),
+            corners=xyxy_to_obb_corners(10, 10, 30, 90).tolist(),
+            confidence=0.8,
+            model_source="DINO+SAM3+SAM",
+            needs_review=True,
+            attributes={
+                "decision": "REVIEW", "geometry_score": 0.7, "geometry_status": "warning",
+                "qwen_class": "electric_utility_pole", "qwen_semantic_confidence": 0.6,
+                "obb_source": "mask",
+            },
+        )
+        self.mgr.save_predictions(
+            self.ds_id, self.img_name, [box], raw_outputs={"dino": [{"a": 1}], "sam3_candidates": []},
+        )
+
+        record = self.mgr.get_predictions(self.ds_id, self.img_name)
+        self.assertIn("summary", record)
+        summary = record["summary"]
+        self.assertEqual(summary["image"], self.img_name)
+        self.assertIn("dino", summary)
+        self.assertIn("sam3", summary)
+        self.assertIn("geometry", summary)
+        self.assertIn("qwen", summary)
+        self.assertIn("obb", summary)
+        self.assertEqual(summary["final_status"], "needs_review")
+        self.assertEqual(len(summary["geometry"]), 1)
+        self.assertEqual(summary["geometry"][0]["geometry_status"], "warning")
+        # Existing structure must be completely unaffected.
+        self.assertIn("boxes", record)
+        self.assertIn("raw_outputs", record)
+
 
 if __name__ == "__main__":
     unittest.main()

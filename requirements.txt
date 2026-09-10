@@ -20,6 +20,7 @@ ultralytics==8.4.45
 fastapi==0.136.1
 uvicorn[standard]==0.46.0
 python-multipart==0.0.32
+requests==2.32.5  # models/adapters/sam3_http_adapter.py (isolated SAM3 service client)
 
 # Computer Vision & Image Processing
 opencv-python==4.13.0

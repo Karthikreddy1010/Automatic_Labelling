@@ -64,19 +64,6 @@ from src.geometry_obb import (
 storage_mgr = DatasetManager()
 active_device = "AUTO"
 
-# Model Adapters
-# Prefer the trained pole-specific OBB detector over the generic candidate
-# weights in YOLOAdapter.DEFAULT_CANDIDATE_PATHS when it's present.
-_TRAINED_YOLO_OBB_WEIGHTS = "models/best.pt"
-yolo_adapter = YOLOAdapter(
-    weights_path=_TRAINED_YOLO_OBB_WEIGHTS if os.path.exists(_TRAINED_YOLO_OBB_WEIGHTS) else None
-)
-dino_adapter = GroundingDINOAdapter()
-sam21_adapter = SAM21Adapter()
-sam3_adapter = SAM3Adapter()
-qwen_verifier = QwenVerifier()
-gemini_verifier = GeminiVerifier()
-
 
 def _load_verification_pipeline_config() -> Dict[str, Any]:
     """
@@ -100,6 +87,62 @@ _verification_cfg = _load_verification_pipeline_config()
 GEOMETRY_QA_CONFIG = geometry_config_from_dict(_verification_cfg.get("geometry_qa"))
 DECISION_CONFIG = decision_config_from_dict(_verification_cfg.get("decision"))
 QWEN_GATING_DEFAULT = (_verification_cfg.get("qwen") or {}).get("gating", "gated")
+
+
+def _build_sam3_adapter():
+    """
+    Part 2: pick the in-process SAM3Adapter or a remote SAM3HttpAdapter based
+    on verification_pipeline.sam3.backend. "auto" prefers in-process (works
+    fine if transformers>=5.9 is installed in this same environment) and
+    only falls back to the HTTP client when a service_url is actually
+    configured -- so a plain in-process setup (most deployments) needs zero
+    extra config.
+    """
+    sam3_cfg = _verification_cfg.get("sam3", {}) or {}
+    backend_pref = os.environ.get("SAM3_BACKEND", sam3_cfg.get("backend", "auto"))
+    service_url = os.environ.get("SAM3_SERVICE_URL", sam3_cfg.get("service_url"))
+
+    if backend_pref == "http" or (backend_pref == "auto" and service_url):
+        from models.adapters.sam3_http_adapter import SAM3HttpAdapter
+        return SAM3HttpAdapter(service_url=service_url or "http://127.0.0.1:8801")
+    return SAM3Adapter()
+
+
+def _build_qwen_verifier() -> QwenVerifier:
+    """
+    Reads verification_pipeline.qwen.* (Task 1's config keys) so the
+    Transformers/Ollama/DashScope backend selection, local checkpoint path,
+    dtype, device_map, and context-crop expansion are actually driven by
+    configs/config.yaml rather than requiring every value to be set via
+    environment variables. Any individual key can still be overridden by its
+    existing env var (QWEN_MODEL_PATH, QWEN_OLLAMA_MODEL, etc.) -- the
+    QwenVerifier constructor already prefers an explicit constructor arg over
+    the env var, and here the config value is only used when the env var
+    itself is unset.
+    """
+    qwen_cfg = _verification_cfg.get("qwen", {}) or {}
+    tvl_cfg = qwen_cfg.get("transformers", {}) or {}
+    return QwenVerifier(
+        local_model_path=os.environ.get("QWEN_MODEL_PATH") or tvl_cfg.get("model_path"),
+        context_crop_expand_pct=float(qwen_cfg.get("context_crop_expand_pct", 0.30)),
+        backend=os.environ.get("QWEN_BACKEND", qwen_cfg.get("backend", "auto")),
+        transformers_dtype=tvl_cfg.get("dtype", "bfloat16"),
+        transformers_device_map=tvl_cfg.get("device_map", "auto"),
+    )
+
+
+# Model Adapters
+# Prefer the trained pole-specific OBB detector over the generic candidate
+# weights in YOLOAdapter.DEFAULT_CANDIDATE_PATHS when it's present.
+_TRAINED_YOLO_OBB_WEIGHTS = "models/best.pt"
+yolo_adapter = YOLOAdapter(
+    weights_path=_TRAINED_YOLO_OBB_WEIGHTS if os.path.exists(_TRAINED_YOLO_OBB_WEIGHTS) else None
+)
+dino_adapter = GroundingDINOAdapter()
+sam21_adapter = SAM21Adapter()
+sam3_adapter = _build_sam3_adapter()
+qwen_verifier = _build_qwen_verifier()
+gemini_verifier = GeminiVerifier()
 
 
 # --- BATCH ENGINE STATE ---
@@ -367,6 +410,13 @@ def import_images_endpoint(dataset_id: str, req: ImportImagesRequest):
     return {"imported_count": len(imported), "imported_images": imported}
 
 
+@app.post("/api/datasets/{dataset_id}/import_upload")
+async def import_uploaded_images_endpoint(dataset_id: str, files: List[UploadFile] = File(...)):
+    payload = [(f.filename or "", await f.read()) for f in files]
+    imported = storage_mgr.import_uploaded_files(dataset_id, payload)
+    return {"imported_count": len(imported), "imported_images": imported}
+
+
 @app.get("/api/datasets/{dataset_id}/images/{filename}")
 def serve_image(dataset_id: str, filename: str):
     img_path = storage_mgr.get_image_path(dataset_id, filename)
@@ -424,6 +474,12 @@ def reject_image_annotation(
         al_categories=al_cats
     )
     return {"message": "Image marked as rejected", "annotation": saved}
+
+
+@app.post("/api/datasets/{dataset_id}/images/{filename}/skip")
+def skip_image_endpoint(dataset_id: str, filename: str):
+    storage_mgr.mark_skipped(dataset_id, filename)
+    return {"status": "skipped", "filename": filename}
 
 
 @app.get("/api/datasets/{dataset_id}/images/{filename}/predictions")
@@ -573,6 +629,7 @@ def _sam_refine_candidates(
     img_width: int,
     img_height: int,
     model_source: str = "DINO+SAM",
+    timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[DetectionBox], int, int]:
     """
     Refine up to SAM_REFINE_TOP_N deduped candidates (highest confidence
@@ -588,14 +645,19 @@ def _sam_refine_candidates(
     DetectionBox.to_dict) so the caller can run geometry QA without
     re-running SAM.
 
-    Returns (kept_boxes, n_quality_rejected, n_invalid_obb).
+    Returns (kept_boxes, n_quality_rejected, n_invalid_obb). If `timings` is
+    given, accumulates "sam3_refine_ms" (time spent in segment_box calls) and
+    "obb_ms" (time spent generating/validating OBBs from masks) into it.
     """
     result_boxes: List[DetectionBox] = []
     n_rejected = 0
     n_invalid_obb = 0
+    sam_ms_total = 0.0
+    obb_ms_total = 0.0
     sorted_candidates = sorted(candidates, key=lambda b: b.confidence, reverse=True)[:SAM_REFINE_TOP_N]
     for idx, det in enumerate(sorted_candidates):
         mask = None
+        _t_sam = time.perf_counter()
         try:
             if sam21_adapter.is_available():
                 mask = sam21_adapter.segment_box(str(img_path), det.xyxy)
@@ -603,13 +665,16 @@ def _sam_refine_candidates(
                 mask = sam3_adapter.segment_box(str(img_path), det.xyxy)
         except Exception:
             pass
+        sam_ms_total += (time.perf_counter() - _t_sam) * 1000
 
         quality = score_pole_quality(mask, det.xyxy, det.confidence)
         if quality["category"] == "REJECT":
             n_rejected += 1
             continue
 
+        _t_obb = time.perf_counter()
         obb_result = generate_and_validate_obb(mask, det.xyxy, img_width, img_height)
+        obb_ms_total += (time.perf_counter() - _t_obb) * 1000
         if not obb_result["valid"]:
             n_invalid_obb += 1
             continue
@@ -649,6 +714,9 @@ def _sam_refine_candidates(
                 "obb_source": obb_result["source"],
             }
         ))
+    if timings is not None:
+        timings["sam3_refine_ms"] = round(sam_ms_total, 1)
+        timings["obb_ms"] = round(obb_ms_total, 1)
     return result_boxes, n_rejected, n_invalid_obb
 
 
@@ -659,6 +727,7 @@ def _apply_verification(
     img_height: int,
     enable_geometry_qa: bool = True,
     qwen_gating: str = "gated",
+    timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[DetectionBox], Dict[str, int]]:
     """
     Stage 4 of the production pipeline (after SAM refinement): geometry QA +
@@ -691,11 +760,15 @@ def _apply_verification(
         "qwen_available": qwen_verifier.is_available(),
     }
     kept: List[DetectionBox] = []
+    geometry_ms_total = 0.0
+    qwen_ms_total = 0.0
 
     for det in candidates:
         geometry_result = None
         if enable_geometry_qa:
+            _t_geo = time.perf_counter()
             geometry_result = run_geometry_qa(det.mask, np.array(det.corners), img_width, img_height, GEOMETRY_QA_CONFIG)
+            geometry_ms_total += (time.perf_counter() - _t_geo) * 1000
 
         geometry_hard_fail = bool(geometry_result and geometry_result["geometry_status"] == "fail")
 
@@ -706,7 +779,9 @@ def _apply_verification(
 
         semantic_result = None
         if should_call_qwen and qwen_verifier.is_available():
+            _t_qwen = time.perf_counter()
             semantic_result = qwen_verifier.verify(str(img_path), det)
+            qwen_ms_total += (time.perf_counter() - _t_qwen) * 1000
             counts["n_qwen_calls"] += 1
 
         segmentation_score = compute_segmentation_score(det.mask, det.xyxy)
@@ -751,6 +826,9 @@ def _apply_verification(
             continue
         kept.append(det)
 
+    if timings is not None:
+        timings["geometry_ms"] = round(geometry_ms_total, 1)
+        timings["qwen_ms"] = round(qwen_ms_total, 1)
     return kept, counts
 
 
@@ -807,14 +885,19 @@ def run_ai_pipeline(
     # dedup -> SAM 2.1 refinement -> quality-scored OBB.
     # YOLO (best.pt / A_S.pt) is intentionally never called here.
     if mode in ("AI_LABEL", "DINO_SAM", "DINO_ONLY"):
+        timings: Dict[str, float] = {}
+        _t0 = time.perf_counter()
+
         if not dino_adapter.is_available():
             raw_outputs["error"] = "DINO unavailable"
             return [], raw_outputs
 
+        _t_dino = time.perf_counter()
         dino_boxes = dino_adapter.predict(
             str(img_path), conf_threshold=conf_threshold, iou_threshold=iou_threshold,
             text_threshold=text_threshold, max_candidates=max_candidates or DINO_MAX_RAW_CANDIDATES,
         )
+        timings["dino_ms"] = round((time.perf_counter() - _t_dino) * 1000, 1)
         raw_outputs["dino_raw_count"] = len(dino_boxes)
 
         # SAM3 also proposes candidates via its own open-vocabulary
@@ -825,11 +908,13 @@ def run_ai_pipeline(
         # every surviving candidate (DINO- or SAM3-proposed) goes through
         # the same SAM 2.1 refinement + quality-scoring path.
         sam3_candidates: List[DetectionBox] = []
+        _t_sam3_propose = time.perf_counter()
         if sam3_adapter.is_available():
             try:
                 sam3_candidates = sam3_adapter.detect_and_segment(str(img_path))
             except Exception:
                 sam3_candidates = []
+        timings["sam3_propose_ms"] = round((time.perf_counter() - _t_sam3_propose) * 1000, 1)
         raw_outputs["sam3_raw_count"] = len(sam3_candidates)
 
         combined_candidates = dedup_by_iou(dino_boxes + sam3_candidates, iou_threshold=DEDUP_IOU_THRESHOLD)
@@ -838,6 +923,9 @@ def run_ai_pipeline(
         raw_outputs["combined_deduped_count"] = len(combined_candidates)
 
         if mode == "DINO_ONLY" or not use_sam_refinement:
+            timings["total_ms"] = round((time.perf_counter() - _t0) * 1000, 1)
+            if (_verification_cfg.get("logging", {}) or {}).get("log_stage_timings", True):
+                raw_outputs["timings"] = timings
             return combined_candidates, raw_outputs
 
         if not (sam21_adapter.is_available() or sam3_adapter.is_available()):
@@ -849,7 +937,7 @@ def run_ai_pipeline(
 
         result_boxes, n_rejected, n_invalid_obb = _sam_refine_candidates(
             combined_candidates, img_path, dataset_id, filename, img_width, img_height,
-            model_source="DINO+SAM3+SAM",
+            model_source="DINO+SAM3+SAM", timings=timings,
         )
         raw_outputs["n_sam_rejected"] = n_rejected
         raw_outputs["n_invalid_obb"] = n_invalid_obb
@@ -857,13 +945,18 @@ def run_ai_pipeline(
         gating = qwen_gating if qwen_gating is not None else QWEN_GATING_DEFAULT
         result_boxes, verify_counts = _apply_verification(
             result_boxes, img_path, img_width, img_height,
-            enable_geometry_qa=enable_geometry_qa, qwen_gating=gating,
+            enable_geometry_qa=enable_geometry_qa, qwen_gating=gating, timings=timings,
         )
         raw_outputs["verification"] = {
             "geometry_qa_enabled": enable_geometry_qa,
             "qwen_gating": gating,
             **verify_counts,
         }
+
+        timings["total_ms"] = round((time.perf_counter() - _t0) * 1000, 1)
+        if (_verification_cfg.get("logging", {}) or {}).get("log_stage_timings", True):
+            raw_outputs["timings"] = timings
+            print(f"[timing] {filename or img_path.name}: {timings}")
         return result_boxes, raw_outputs
 
     # 2. OPTIONAL ACCELERATOR: YOLO / YOLO-OBB
