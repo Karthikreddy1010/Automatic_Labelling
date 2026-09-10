@@ -327,5 +327,91 @@ class TestBackendAPI(unittest.TestCase):
 
 
 
+class TestSAM3PrimarySAM21Fallback(unittest.TestCase):
+    """SAM3 is the preferred segmenter (matches the spec's SAM3-upgrade
+    intent); SAM 2.1 is only used when SAM3 itself is unavailable. Verified
+    at unit level by mocking is_available()/segment_box() on the real
+    module-level adapter instances -- no real model weights needed."""
+
+    def setUp(self):
+        from backend import app as app_module
+        self.app_module = app_module
+
+    def test_sam_refine_candidates_prefers_sam3_when_both_available(self):
+        from backend.app import _sam_refine_candidates
+        from unittest.mock import patch
+        import numpy as np
+
+        mask = np.ones((50, 50), dtype=np.uint8)
+        candidate = DetectionBox(
+            xyxy=(10.0, 10.0, 30.0, 40.0),
+            corners=xyxy_to_obb_corners(10, 10, 30, 40).tolist(),
+            confidence=0.9, model_source="DINO",
+        )
+        with patch.object(self.app_module.sam21_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.sam3_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.sam21_adapter, "segment_box") as mock_sam21, \
+             patch.object(self.app_module.sam3_adapter, "segment_box", return_value=mask) as mock_sam3:
+            _sam_refine_candidates([candidate], Path("dummy.jpg"), None, None, 100, 100)
+
+        mock_sam3.assert_called_once()
+        mock_sam21.assert_not_called()
+
+    def test_sam_refine_candidates_falls_back_to_sam21_when_sam3_unavailable(self):
+        from backend.app import _sam_refine_candidates
+        from unittest.mock import patch
+        import numpy as np
+
+        mask = np.ones((50, 50), dtype=np.uint8)
+        candidate = DetectionBox(
+            xyxy=(10.0, 10.0, 30.0, 40.0),
+            corners=xyxy_to_obb_corners(10, 10, 30, 40).tolist(),
+            confidence=0.9, model_source="DINO",
+        )
+        with patch.object(self.app_module.sam21_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.sam3_adapter, "is_available", return_value=False), \
+             patch.object(self.app_module.sam21_adapter, "segment_box", return_value=mask) as mock_sam21, \
+             patch.object(self.app_module.sam3_adapter, "segment_box") as mock_sam3:
+            _sam_refine_candidates([candidate], Path("dummy.jpg"), None, None, 100, 100)
+
+        mock_sam21.assert_called_once()
+        mock_sam3.assert_not_called()
+
+    def test_segment_box_endpoint_prefers_sam3_when_both_available(self):
+        from unittest.mock import patch
+        import numpy as np
+
+        mask = np.ones((50, 50), dtype=np.uint8)
+        ds_id = "sam_priority_test_ds"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "SAM Priority Test", "classes": ["utility_pole"]})
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img_name = "sam_priority.jpg"
+        cv2.imwrite(str(img_dir / img_name), np.zeros((100, 100, 3), dtype=np.uint8))
+        storage_mgr.import_images(ds_id, [img_dir / img_name])
+
+        with patch.object(self.app_module.sam21_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.sam3_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.sam21_adapter, "segment_and_generate_obb") as mock_sam21, \
+             patch.object(self.app_module.sam3_adapter, "segment_box", return_value=mask) as mock_sam3:
+            res = self.client.post("/api/inference/segment_box", json={
+                "dataset_id": ds_id, "filename": img_name, "box_xyxy": [10, 10, 30, 40],
+            })
+
+        self.assertEqual(res.status_code, 200)
+        mock_sam3.assert_called_once()
+        mock_sam21.assert_not_called()
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+        cls.test_dir = tempfile.mkdtemp()
+        storage_mgr.base_dir = Path(cls.test_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.test_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

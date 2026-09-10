@@ -659,10 +659,12 @@ def _sam_refine_candidates(
         mask = None
         _t_sam = time.perf_counter()
         try:
-            if sam21_adapter.is_available():
-                mask = sam21_adapter.segment_box(str(img_path), det.xyxy)
-            elif sam3_adapter.is_available():
+            # SAM3 is preferred (per the spec's SAM3-upgrade intent); SAM 2.1
+            # is only used when SAM3 itself is unavailable.
+            if sam3_adapter.is_available():
                 mask = sam3_adapter.segment_box(str(img_path), det.xyxy)
+            elif sam21_adapter.is_available():
+                mask = sam21_adapter.segment_box(str(img_path), det.xyxy)
         except Exception:
             pass
         sam_ms_total += (time.perf_counter() - _t_sam) * 1000
@@ -967,11 +969,13 @@ def run_ai_pipeline(
         if use_sam_refinement and (sam21_adapter.is_available() or sam3_adapter.is_available()):
             for det in yolo_boxes[:3]:
                 try:
-                    if sam21_adapter.is_available():
-                        _, new_corners = sam21_adapter.segment_and_generate_obb(str(img_path), det.xyxy)
-                    else:
+                    # SAM3 is preferred; SAM 2.1 is only used when SAM3 itself
+                    # is unavailable.
+                    if sam3_adapter.is_available():
                         mask = sam3_adapter.segment_box(str(img_path), det.xyxy)
                         new_corners = mask_to_obb_corners(mask) if mask is not None else None
+                    else:
+                        _, new_corners = sam21_adapter.segment_and_generate_obb(str(img_path), det.xyxy)
                     if new_corners is not None:
                         det.corners = new_corners.tolist()
                         det.attributes["refined_by_sam"] = True
@@ -1060,11 +1064,12 @@ def segment_box_endpoint(req: SegmentBoxRequest):
     mask = None
     corners = None
 
-    if sam21_adapter.is_available():
-        mask, corners = sam21_adapter.segment_and_generate_obb(str(img_path), box_tuple)
-    elif sam3_adapter.is_available():
+    # SAM3 is preferred; SAM 2.1 is only used when SAM3 itself is unavailable.
+    if sam3_adapter.is_available():
         mask = sam3_adapter.segment_box(str(img_path), box_tuple)
         corners = mask_to_obb_corners(mask) if mask is not None else None
+    elif sam21_adapter.is_available():
+        mask, corners = sam21_adapter.segment_and_generate_obb(str(img_path), box_tuple)
 
     if corners is None:
         # Fallback to canonical box
