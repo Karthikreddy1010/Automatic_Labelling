@@ -35,7 +35,7 @@ The application will start the FastAPI server and automatically open your defaul
 
 ### 2. Single-Image AI Labeling
 - **AI Label** (production pipeline) — YOLO/`best.pt` is **never** used here:
-  1. Grounding DINO + SAM 3 each propose candidate boxes (open-vocabulary, text-prompted).
+  1. **Grounding DINO** proposes candidate boxes (open-vocabulary, text-prompted) — WHERE the pole might be. SAM 3's own candidate-proposal is available but off by default (`verification_pipeline.sam3.enable_candidate_proposal`) to avoid a redundant second SAM 3 call per candidate — see "Note on SAM 3" below.
   2. Candidates are deduplicated by IoU so one physical pole doesn't produce overlapping labels.
   3. The top candidates are segmented with **SAM 3** (falling back to SAM 2.1 only when SAM 3 itself is unavailable) into a precise mask, and a canonical 4-corner OBB is generated and structurally validated from it.
   4. **Geometry QA** scores mask/OBB shape plausibility (aspect ratio, orientation, fragmentation) — configurable thresholds, never hard-rejects on tilt or a frame-cut-off pole alone.
@@ -135,9 +135,16 @@ backend, if any, was found — it now names the actual backend (`transformers`
 / `ollama` / `dashscope`) rather than a hard-coded label.
 
 ## Note on SAM 3
-SAM 3 is the **preferred** segmenter — DINO/SAM 3 both propose candidates,
-and SAM 3 performs mask refinement whenever it's available, with SAM 2.1
-used only as a fallback when SAM 3 itself isn't. SAM 3 requires
+SAM 3 is the **preferred segmenter** (mask refinement), not a second
+candidate proposer — DINO alone decides WHERE candidates are in production;
+SAM 3 decides WHICH PIXELS belong to each one, with SAM 2.1 used only as a
+fallback when SAM 3 itself isn't available. SAM 3's own open-vocabulary
+detection *can* also propose candidates alongside DINO, but this is off by
+default (`verification_pipeline.sam3.enable_candidate_proposal: false`) —
+enabling it calls SAM 3 twice per SAM-3-proposed candidate (propose+segment,
+then segment again during refinement), which is redundant inference; it
+exists only for the experimental "DINO+SAM3 dual proposer" comparison path.
+SAM 3 requires
 `transformers>=5.9`; this repo currently pins `4.57.0` (see
 [REQUIREMENTS.md](REQUIREMENTS.md)), so on an unmodified install SAM 3
 reports `unavailable` and SAM 2.1 handles refinement instead — the pipeline

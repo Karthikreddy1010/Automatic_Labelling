@@ -77,7 +77,15 @@ class SAM3HttpAdapter(BaseSegmenter):
                 timeout=self.timeout_s,
             )
             resp.raise_for_status()
-            return [DetectionBox.from_dict(d) for d in resp.json().get("detections", [])]
+            results = []
+            for entry in resp.json().get("detections", []):
+                mask_b64 = entry.pop("mask_b64", None)
+                det = DetectionBox.from_dict(entry)
+                if mask_b64:
+                    mask_img = Image.open(io.BytesIO(base64.b64decode(mask_b64)))
+                    det.mask = (np.array(mask_img) > 0).astype(np.uint8)
+                results.append(det)
+            return results
         except Exception as e:
             self._last_error = f"SAM3 service detect_and_segment failed: {e}"
             return []

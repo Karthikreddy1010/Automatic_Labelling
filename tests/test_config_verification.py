@@ -35,6 +35,13 @@ class TestVerificationConfigKeys(unittest.TestCase):
         self.assertIn(self.vp["sam3"]["backend"], ("auto", "inprocess", "http"))
         self.assertIn("service_url", self.vp["sam3"])
 
+    def test_sam3_candidate_proposal_off_by_default(self):
+        # DINO alone proposes candidates in production; SAM3's own
+        # detect_and_segment() candidate-proposal is redundant production
+        # inference and must default to disabled.
+        self.assertIn("enable_candidate_proposal", self.vp["sam3"])
+        self.assertFalse(self.vp["sam3"]["enable_candidate_proposal"])
+
     def test_logging_section_present(self):
         self.assertIn("log_stage_timings", self.vp["logging"])
 

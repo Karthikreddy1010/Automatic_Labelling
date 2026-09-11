@@ -427,6 +427,27 @@ async function loadDatasets() {
   }
 }
 
+/**
+ * Prompt for a new dataset name (bound to the "+" button next to the
+ * dataset dropdown) and create it. Guards against overwriting an existing
+ * dataset's metadata: create_dataset() on the backend silently resets
+ * metadata.json (image_count/status tracking) if the sanitized ID already
+ * exists, so a same-named collision is caught here first rather than
+ * silently wiping a dataset the user didn't mean to touch.
+ */
+async function promptCreateDataset() {
+  const name = prompt('New dataset name:');
+  if (!name || !name.trim()) return;
+
+  const id = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_');
+  if (state.datasets.some(ds => ds.dataset_id === id)) {
+    alert(`A dataset with id "${id}" already exists. Choose a different name.`);
+    return;
+  }
+
+  await createNewDataset(id, name.trim());
+}
+
 async function createNewDataset(id, name) {
   try {
     const res = await fetch(API_BASE + 'api/datasets', {
@@ -435,6 +456,7 @@ async function createNewDataset(id, name) {
       body: JSON.stringify({ dataset_id: id, name: name, classes: ['utility_pole'] })
     });
     const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
     await loadDatasets();
   } catch (err) {
     alert('Failed to create dataset: ' + err.message);
@@ -983,6 +1005,7 @@ function setupEventListeners() {
   elements.btnResumeBatch.addEventListener('click', () => fetch(API_BASE + 'api/batch/resume', { method: 'POST' }));
   elements.btnCancelBatch.addEventListener('click', () => fetch(API_BASE + 'api/batch/cancel', { method: 'POST' }));
   
+  elements.btnNewDataset.addEventListener('click', promptCreateDataset);
   elements.btnImportImages.addEventListener('click', () => elements.importModal.classList.remove('hidden'));
   elements.btnCloseImportModal.addEventListener('click', closeImportModal);
   elements.btnCancelImport.addEventListener('click', closeImportModal);
@@ -1434,11 +1457,27 @@ function updateSelectionInspector() {
 }
 
 function deleteSelectedBox() {
-  if (state.selectedBoxIndex < 0 || state.selectedBoxIndex >= state.boxes.length) return;
-  state.boxes.splice(state.selectedBoxIndex, 1);
-  state.selectedBoxIndex = -1;
+  deleteBoxAtIndex(state.selectedBoxIndex);
+}
+
+/**
+ * Remove a single label by index -- the underlying operation for both the
+ * Inspector panel's Delete button (deleteSelectedBox, uses the currently
+ * selected box) and each Labels-list row's own inline delete button (lets
+ * you remove one of several poles directly from the list, without first
+ * having to find and click its OBB on the canvas).
+ */
+function deleteBoxAtIndex(idx) {
+  if (idx < 0 || idx >= state.boxes.length) return;
+  state.boxes.splice(idx, 1);
+  if (state.selectedBoxIndex === idx) {
+    state.selectedBoxIndex = -1;
+  } else if (state.selectedBoxIndex > idx) {
+    state.selectedBoxIndex -= 1;
+  }
   pushHistory();
   updateSelectionInspector();
+  renderLabelList();
   render();
 }
 
@@ -1609,6 +1648,17 @@ function renderLabelList() {
     statusEl.className = `label-row-status ${statusClass}`;
     statusEl.textContent = statusLabel;
     row.appendChild(statusEl);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'label-row-remove';
+    removeBtn.type = 'button';
+    removeBtn.title = `Remove Pole ${idx + 1}`;
+    removeBtn.textContent = '×';
+    removeBtn.addEventListener('click', (e) => {
+      e.stopPropagation(); // don't also trigger the row's own select-on-click
+      deleteBoxAtIndex(idx);
+    });
+    row.appendChild(removeBtn);
 
     row.addEventListener('click', () => {
       state.selectedBoxIndex = idx;

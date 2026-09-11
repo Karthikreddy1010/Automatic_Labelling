@@ -171,6 +171,15 @@ verification_pipeline:
     # e.g. "http://127.0.0.1:8801" -- falls back to the SAM3_SERVICE_URL env
     # var if null. Only used when backend resolves to "http".
     service_url: null
+    # Production default is false: DINO alone proposes candidate boxes (WHERE),
+    # SAM3 only refines them via box-prompt segmentation (PIXELS) -- keeping
+    # the two models' responsibilities separated and avoiding a redundant
+    # second SAM3 call per SAM3-proposed candidate (its own detect_and_segment
+    # mask would otherwise just be discarded and re-segmented via segment_box
+    # moments later). Set true only for the experimental "DINO+SAM3 as dual
+    # proposers" comparison path (see benchmark_dino_sam.py) -- never as the
+    # production default.
+    enable_candidate_proposal: false
 
   logging:
     # Emit per-stage timing (dino_ms/sam3_ms/geometry_ms/qwen_ms/obb_ms/

@@ -65,20 +65,19 @@ fallback design.
 ```
 image
   │
-  ├─► Grounding DINO ──┐
-  │  (open-vocab, text- │
-  │   prompted candidates)
-  │                     ├─► dedup_by_iou() ──► up to SAM_REFINE_TOP_N (5)
-  ├─► SAM 3             │    (quality.py)      highest-confidence candidates
-  │  (open-vocab detect+┘
-  │   segment; also
-  │   proposes boxes)
+  ▼
+Grounding DINO ──► dedup_by_iou() ──► up to SAM_REFINE_TOP_N (5)
+  (open-vocab, text-      (quality.py)      highest-confidence candidates
+   prompted candidates
+   -- WHERE the pole
+   might be)
   │
   ▼
 SAM 3 (or SAM 2.1 fallback) segments each ──► score_pole_quality()
   candidate into a precise mask               (quality.py) — REJECT-bucketed
   (SAM 3 preferred; SAM 2.1 used only          candidates dropped here
-   when SAM 3 itself is unavailable)
+   when SAM 3 itself is unavailable --
+   WHICH PIXELS belong to the candidate)
   ▼
 mask → canonical 4-corner OBB ──► obb_generator.validate_obb()
   (src/geometry_obb.py)             (in-bounds, non-self-intersecting,
@@ -111,8 +110,21 @@ reuses `quality.py`'s underlying mask-geometry/overlap sub-signals (not its
 already-DINO-blended `quality_score`), so DINO confidence isn't counted
 twice.
 
+**DINO alone proposes candidates in production** — model responsibilities
+stay separated (DINO = WHERE, SAM3 = PIXELS). SAM3's own open-vocabulary
+`detect_and_segment()` candidate-proposal is available but **off by
+default** (`verification_pipeline.sam3.enable_candidate_proposal: false`):
+enabling it would call SAM3 twice per SAM3-proposed candidate (once to
+propose+segment, once more via `segment_box()` moments later during
+refinement, discarding the first mask) — redundant production inference.
+Set it `true` only for the experimental "DINO+SAM3 as dual proposers"
+comparison path (e.g. `benchmark_dino_sam.py --compare-configs`), never in
+production.
+
 ### Configuration (`configs/config.yaml`, section `verification_pipeline`)
 - `qwen.gating`: `off` | `gated` (default) | `always`.
+- `sam3.enable_candidate_proposal`: `false` (default, production) | `true`
+  (experimental dual-proposer comparison only — see above).
 - `geometry_qa.*`: aspect ratio, tilt, fill-ratio, solidity, image-area-
   fraction thresholds — all configurable, no single hard-coded global value.
 - `decision.weights`: `detection`/`semantic`/`geometry`/`segmentation`

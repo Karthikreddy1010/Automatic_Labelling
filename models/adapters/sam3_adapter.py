@@ -168,6 +168,7 @@ class SAM3Adapter(BaseSegmenter):
                     model_source="SAM3",
                     needs_review=needs_review,
                     review_reasons=reasons,
+                    mask=cleaned_m,
                 )
                 detections.append(det)
 
@@ -190,11 +191,34 @@ class SAM3Adapter(BaseSegmenter):
         installed Sam3Processor doesn't accept input_boxes (API differences
         across transformers versions), so this never hard-depends on an exact
         signature this session couldn't verify against a live HAWK install.
+
+        Public BaseSegmenter-compatible signature (mask only) -- see
+        segment_box_with_score() for the mask+confidence variant used by
+        services/sam3_service.py.
+        """
+        mask, _score = self.segment_box_with_score(image, box_xyxy)
+        return mask
+
+    def segment_box_with_score(
+        self,
+        image: Union[str, np.ndarray, Image.Image],
+        box_xyxy: Tuple[float, float, float, float]
+    ) -> Tuple[Optional[np.ndarray], Optional[float]]:
+        """
+        Same box-prompted segmentation as segment_box(), but also returns a
+        confidence score when the native box-prompt path produces one (SAM's
+        mask decoder typically emits an IoU/quality score per predicted mask,
+        e.g. `out.iou_scores`). Best-effort: this session could not verify
+        the exact field name against a live SAM3 install, so a missing/
+        differently-named field just yields score=None rather than raising --
+        the mask itself is unaffected either way. The crop-based fallback
+        path has no native score to report (score=None), consistent with
+        segment_box()'s existing behavior there.
         """
         if self.model is None or self.proc is None:
             ok = self.load(self.device)
             if not ok:
-                return None
+                return None, None
 
         import torch
 
@@ -206,7 +230,7 @@ class SAM3Adapter(BaseSegmenter):
         elif isinstance(image, Image.Image):
             pil_img = image.convert("RGB")
         else:
-            return None
+            return None, None
 
         try:
             inp = self.proc(
@@ -224,7 +248,18 @@ class SAM3Adapter(BaseSegmenter):
                 m = m.cpu().numpy() if hasattr(m, "cpu") else np.asarray(m)
                 if m.ndim == 3:
                     m = m[0]
-                return _clean((m > 0).astype(np.uint8), box_xyxy)
+                cleaned = _clean((m > 0).astype(np.uint8), box_xyxy)
+
+                score: Optional[float] = None
+                iou_scores = getattr(out, "iou_scores", None)
+                if iou_scores is not None:
+                    try:
+                        s = iou_scores[0][0]
+                        s = s.max() if hasattr(s, "max") else s
+                        score = float(s.cpu().item()) if hasattr(s, "cpu") else float(s)
+                    except Exception:
+                        score = None
+                return cleaned, score
         except Exception:
             pass  # native box-prompting unsupported/failed -- fall back below
 
@@ -242,7 +277,7 @@ class SAM3Adapter(BaseSegmenter):
         cropped = pil_img.crop(crop_box)
         dets = self.detect_and_segment(cropped)
         if not dets:
-            return None
+            return None, None
 
         # Return best match placed back onto full image canvas
         full_mask = np.zeros((h, w), dtype=np.uint8)
@@ -255,8 +290,8 @@ class SAM3Adapter(BaseSegmenter):
             corners[:, 1] += crop_box[1]
             import cv2
             cv2.fillPoly(full_mask, [corners.astype(np.int32)], 255)
-            return full_mask
-        return None
+            return full_mask, best_det.confidence
+        return None, None
 
     def get_info(self) -> ModelInfo:
         return ModelInfo(

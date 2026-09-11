@@ -87,6 +87,10 @@ _verification_cfg = _load_verification_pipeline_config()
 GEOMETRY_QA_CONFIG = geometry_config_from_dict(_verification_cfg.get("geometry_qa"))
 DECISION_CONFIG = decision_config_from_dict(_verification_cfg.get("decision"))
 QWEN_GATING_DEFAULT = (_verification_cfg.get("qwen") or {}).get("gating", "gated")
+# Production default: DINO alone proposes candidates; SAM3 only refines via
+# box-prompt segmentation. True only enables the experimental dual-proposer
+# comparison path (see configs/config.yaml verification_pipeline.sam3 docs).
+SAM3_ENABLE_CANDIDATE_PROPOSAL = bool((_verification_cfg.get("sam3") or {}).get("enable_candidate_proposal", False))
 
 
 def _build_sam3_adapter():
@@ -320,6 +324,12 @@ class BatchStartRequest(BaseModel):
     use_sam_refinement: bool = True
     enable_geometry_qa: bool = True
     qwen_gating: Optional[str] = None
+    # Restrict the run to exactly these filenames instead of the whole
+    # dataset -- for safe, controlled testing on a small explicitly-selected
+    # image set. Filenames not present in the dataset are dropped (not
+    # silently treated as processed); None (the default) means "the whole
+    # dataset", unchanged from before this field existed.
+    filenames: Optional[List[str]] = None
 
 
 # --- HARDWARE & SYSTEM ENDPOINTS ---
@@ -852,13 +862,22 @@ def run_ai_pipeline(
     Executes detection pipeline:
     - AI_LABEL / DINO_SAM (production pipeline; intentionally does NOT call
       YOLO/best.pt/A_S.pt):
-        1. Grounding DINO proposes candidate boxes (box_threshold via
-           conf_threshold, text_threshold, max_candidates all configurable
-           per-request -- see DINO_MAX_RAW_CANDIDATES for the raw cap).
+        1. Grounding DINO proposes candidate boxes -- WHERE the pole might
+           be (box_threshold via conf_threshold, text_threshold,
+           max_candidates all configurable per-request -- see
+           DINO_MAX_RAW_CANDIDATES for the raw cap). SAM3's own
+           detect_and_segment() candidate-proposal is NOT called here by
+           default (SAM3_ENABLE_CANDIDATE_PROPOSAL=False) -- it would be
+           redundant production inference, since every SAM3-proposed
+           candidate gets re-segmented via segment_box() in step 3 anyway,
+           discarding that first mask. Set verification_pipeline.sam3.
+           enable_candidate_proposal=true only for the experimental
+           "DINO+SAM3 dual proposer" comparison path.
         2. Candidates deduped by IoU (dedup_by_iou) so one physical pole
            doesn't produce multiple overlapping labels.
         3. Each of the top SAM_REFINE_TOP_N deduped candidates is segmented
-           with SAM 2.1 (or SAM 3), scored with score_pole_quality(), and
+           with SAM 3 (or SAM 2.1 fallback) -- WHICH PIXELS belong to the
+           candidate -- scored with score_pole_quality(), and
            REJECT-bucketed candidates are dropped. Survivors are flagged
            needs_review unless HIGH_QUALITY. The resulting OBB is generated
            from the mask and structurally validated (obb_generator.py).
@@ -902,19 +921,33 @@ def run_ai_pipeline(
         timings["dino_ms"] = round((time.perf_counter() - _t_dino) * 1000, 1)
         raw_outputs["dino_raw_count"] = len(dino_boxes)
 
-        # SAM3 also proposes candidates via its own open-vocabulary
-        # detect+segment (facebook/sam3, text-prompted) -- reuses this
-        # repo's own gen_candidates.py pattern of merging DINO + SAM3
-        # proposals rather than trusting either alone. Its own mask is not
-        # used here; only its box is added to the shared candidate pool, so
-        # every surviving candidate (DINO- or SAM3-proposed) goes through
-        # the same SAM 2.1 refinement + quality-scoring path.
+        # Production default (SAM3_ENABLE_CANDIDATE_PROPOSAL=False): DINO
+        # alone proposes candidates (WHERE); SAM3 is reserved for box-prompt
+        # refinement (PIXELS) below, keeping the two models' responsibilities
+        # separated. Calling SAM3's own open-vocabulary detect_and_segment()
+        # here too would be redundant production inference -- every
+        # SAM3-proposed candidate gets re-segmented via segment_box() moments
+        # later in _sam_refine_candidates() regardless of origin, discarding
+        # this call's mask entirely. Set verification_pipeline.sam3.
+        # enable_candidate_proposal=true only for the experimental
+        # "DINO+SAM3 as dual proposers" comparison path (e.g.
+        # benchmark_dino_sam.py) -- never in production.
         sam3_candidates: List[DetectionBox] = []
         _t_sam3_propose = time.perf_counter()
-        if sam3_adapter.is_available():
+        if SAM3_ENABLE_CANDIDATE_PROPOSAL and sam3_adapter.is_available():
             try:
                 sam3_candidates = sam3_adapter.detect_and_segment(str(img_path))
-            except Exception:
+            except Exception as e:
+                # is_available() already confirmed the backend is loaded, so
+                # a failure here is a genuine runtime error (CUDA OOM, a
+                # malformed image, an HTTP timeout against the SAM3 service,
+                # etc.) -- log it rather than silently swallowing it, even
+                # though the experimental proposal step degrades gracefully
+                # to "DINO's candidates only" either way.
+                import logging
+                logging.getLogger("sam3").warning(
+                    "SAM3 experimental candidate-proposal failed for %s: %s", img_path.name, e
+                )
                 sam3_candidates = []
         timings["sam3_propose_ms"] = round((time.perf_counter() - _t_sam3_propose) * 1000, 1)
         raw_outputs["sam3_raw_count"] = len(sam3_candidates)
@@ -1175,6 +1208,9 @@ def start_batch_job(req: BatchStartRequest, background_tasks: BackgroundTasks):
         imgs = [img for img in imgs if img.get("status") == "unlabeled"]
 
     image_names = [img["filename"] for img in imgs]
+    if req.filenames is not None:
+        eligible = set(image_names)
+        image_names = [f for f in req.filenames if f in eligible]
     if not image_names:
         return {"message": "No eligible images found to process.", "total": 0}
 

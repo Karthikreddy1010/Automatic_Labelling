@@ -15,6 +15,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 import cv2
 import numpy as np
 from pathlib import Path
@@ -220,6 +221,56 @@ class TestBackendAPI(unittest.TestCase):
         self.assertEqual(res_get.json()["type"], "verified_annotation")
         self.assertEqual(len(res_get.json()["data"]["boxes"]), 1)
 
+    def test_batch_start_with_explicit_filenames_scopes_to_only_those_images(self):
+        """Part 8 of the HAWK test checklist: batch inference must be
+        runnable against a SMALL, explicitly selected image set -- not just
+        'the whole dataset' -- for safe, controlled testing."""
+        from unittest.mock import patch
+        from backend.app import batch_job
+        batch_job.reset()
+        ds_id = "batch_explicit_subset_ds"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Batch Subset Test", "classes": ["utility_pole"]})
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        all_names = [f"pole_{i}.jpg" for i in range(5)]
+        for name in all_names:
+            cv2.imwrite(str(img_dir / name), np.zeros((50, 50, 3), dtype=np.uint8))
+        storage_mgr.import_images(ds_id, [img_dir / n for n in all_names])
+
+        selected = all_names[:2]
+        with patch("backend.app._batch_worker") as mock_worker:
+            res = self.client.post("/api/batch/start", json={
+                "dataset_id": ds_id, "only_unlabeled": False, "filenames": selected,
+            })
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["job"]["total_images"], 2)
+        # The background task must have been scheduled with exactly the
+        # explicit subset, not the full 5-image dataset.
+        mock_worker.assert_called_once()
+        self.assertEqual(mock_worker.call_args[0][1], selected)
+        batch_job.reset()
+
+    def test_batch_start_rejects_filenames_not_in_dataset(self):
+        from backend.app import batch_job
+        batch_job.reset()
+        ds_id = "batch_unknown_filename_ds"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Batch Unknown Test", "classes": ["utility_pole"]})
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(img_dir / "real.jpg"), np.zeros((50, 50, 3), dtype=np.uint8))
+        storage_mgr.import_images(ds_id, [img_dir / "real.jpg"])
+
+        from unittest.mock import patch
+        with patch("backend.app._batch_worker"):
+            res = self.client.post("/api/batch/start", json={
+                "dataset_id": ds_id, "only_unlabeled": False, "filenames": ["real.jpg", "does_not_exist.jpg"],
+            })
+        self.assertEqual(res.status_code, 200)
+        # Only the real image is scoped in; the unknown one is dropped, not silently pretended-processed.
+        self.assertEqual(res.json()["job"]["total_images"], 1)
+        from backend.app import batch_job
+        batch_job.reset()
+
     def test_batch_status_endpoint(self):
         """Test batch engine status query."""
         res = self.client.get("/api/batch/status")
@@ -411,6 +462,48 @@ class TestSAM3PrimarySAM21Fallback(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.test_dir, ignore_errors=True)
+
+
+class TestSAM3CandidateProposalGating(unittest.TestCase):
+    """Production default: DINO alone proposes candidates (WHERE); SAM3 only
+    refines via box-prompt segmentation (PIXELS). SAM3's own
+    detect_and_segment() candidate-proposal path is redundant production
+    inference (its mask gets discarded and re-segmented via segment_box()
+    moments later for every SAM3-proposed candidate) and must be off by
+    default, only reachable via the explicit experimental config flag."""
+
+    def setUp(self):
+        from backend import app as app_module
+        self.app_module = app_module
+
+    def _fake_dino_box(self):
+        return DetectionBox(
+            xyxy=(10.0, 10.0, 30.0, 90.0),
+            corners=xyxy_to_obb_corners(10, 10, 30, 90).tolist(),
+            confidence=0.8, model_source="DINO",
+        )
+
+    def test_sam3_detect_and_segment_not_called_by_default(self):
+        from backend.app import run_ai_pipeline
+        with patch.object(self.app_module.dino_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.dino_adapter, "predict", return_value=[self._fake_dino_box()]), \
+             patch.object(self.app_module.sam3_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.sam3_adapter, "detect_and_segment") as mock_detect, \
+             patch.object(self.app_module, "SAM3_ENABLE_CANDIDATE_PROPOSAL", False):
+            run_ai_pipeline(img_path=Path("dummy.jpg"), mode="DINO_ONLY")
+
+        mock_detect.assert_not_called()
+
+    def test_sam3_detect_and_segment_called_when_experimental_flag_enabled(self):
+        from backend.app import run_ai_pipeline
+        with patch.object(self.app_module.dino_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.dino_adapter, "predict", return_value=[self._fake_dino_box()]), \
+             patch.object(self.app_module.sam3_adapter, "is_available", return_value=True), \
+             patch.object(self.app_module.sam3_adapter, "detect_and_segment", return_value=[]) as mock_detect, \
+             patch.object(self.app_module, "SAM3_ENABLE_CANDIDATE_PROPOSAL", True):
+            run_ai_pipeline(img_path=Path("dummy.jpg"), mode="DINO_ONLY")
+
+        mock_detect.assert_called_once()
 
 
 if __name__ == "__main__":

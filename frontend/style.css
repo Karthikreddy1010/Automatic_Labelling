@@ -552,6 +552,26 @@ body {
   padding: 6px 14px;
   gap: 14px;
   z-index: 20;
+  /* Once the toolbar's buttons no longer fit the viewport, scroll
+     horizontally instead of silently clipping the overflow with no way to
+     reach it -- max-width caps it to the available width so the bar can
+     actually become a scroll container instead of just growing past the
+     screen edge. */
+  max-width: calc(100vw - 40px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+.canvas-bottom-bar::-webkit-scrollbar {
+  height: 6px;
+}
+.canvas-bottom-bar::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+.canvas-bottom-bar > * {
+  flex-shrink: 0;
 }
 .pagination-text {
   font-size: 0.82rem;
@@ -1315,6 +1335,23 @@ body {
   color: var(--color-red);
   flex-shrink: 0;
   cursor: help;
+}
+.label-row-remove {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  line-height: 16px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0;
+}
+.label-row-remove:hover {
+  background: var(--color-red);
+  color: #fff;
 }
 
 /* Coverage & Warnings Card */
