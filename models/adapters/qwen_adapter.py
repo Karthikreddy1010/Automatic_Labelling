@@ -49,6 +49,7 @@ Guarantees:
 """
 
 from __future__ import annotations
+import logging
 import os
 import io
 import re
@@ -61,8 +62,10 @@ from typing import Dict, Any, Optional, Union, Tuple
 import numpy as np
 from PIL import Image
 
+logger = logging.getLogger(__name__)
+
 from models.adapters.base import BaseVerifier, DetectionBox, ModelInfo
-from models.adapters.qwen3vl_transformers_backend import Qwen3VLTransformersBackend
+from models.adapters.qwen3vl_transformers_backend import Qwen3VLTransformersBackend, _looks_like_hub_id
 
 VERIFY_PROMPT_TEMPLATE = (
     "You are an expert electric utility inspector verifying an oriented bounding box (OBB)\n"
@@ -108,6 +111,10 @@ VERIFY_PROMPT_TEMPLATE = (
 _VALID_CLASSES = {
     "electric_utility_pole", "non_utility_pole", "tree",
     "building_or_structure", "street_light_or_lamp_post", "other_object", "uncertain",
+}
+_NON_POLE_CLASSES = {
+    "non_utility_pole", "tree", "building_or_structure",
+    "street_light_or_lamp_post", "other_object",
 }
 _VALID_MATERIALS = {"wood", "steel", "concrete", "composite", "unknown"}
 # Existing internal schema's visibility buckets (kept for decision_engine.py's
@@ -193,6 +200,43 @@ def _normalize_qwen_response(data: Dict[str, Any]) -> Dict[str, Any]:
         decision = _enum("decision", _VALID_DECISION, "review")
         annotation_suitable = decision == "accept"
 
+    reason = str(data.get("reason", ""))[:500] or "No reason provided by Qwen."
+
+    # --- Contradiction detection: conflicting semantic fields must NEVER ---
+    # --- produce an automatic ACCEPT.  Force decision="review" instead.  ---
+    contradiction_flags = []
+
+    # CASE A: is_utility_pole=true but class is a non-pole class
+    if is_utility_pole and cls in _NON_POLE_CLASSES:
+        contradiction_flags.append(
+            f"Contradictory: is_utility_pole=True but class='{cls}'"
+        )
+
+    # CASE B: is_utility_pole=false but class is electric_utility_pole
+    if not is_utility_pole and cls == "electric_utility_pole":
+        contradiction_flags.append(
+            "Contradictory: is_utility_pole=False but class='electric_utility_pole'"
+        )
+
+    # CASE C: annotation_suitable=true but decision=reject
+    if annotation_suitable and decision == "reject":
+        contradiction_flags.append(
+            "Contradictory: annotation_suitable=True but decision='reject'"
+        )
+
+    # CASE D: decision=accept but class is a non-pole class
+    if decision == "accept" and cls in _NON_POLE_CLASSES:
+        contradiction_flags.append(
+            f"Contradictory: decision='accept' but class='{cls}'"
+        )
+
+    if contradiction_flags:
+        decision = "review"
+        annotation_suitable = False
+        reason = reason.rstrip(".") + ". " + "; ".join(contradiction_flags) + "."
+        reason = reason[:500]
+        logger.warning("Qwen response contradictions detected: %s", contradiction_flags)
+
     return {
         "class": cls,
         "material": _enum("material", _VALID_MATERIALS, "unknown"),
@@ -200,7 +244,7 @@ def _normalize_qwen_response(data: Dict[str, Any]) -> Dict[str, Any]:
         "orientation": orientation,
         "semantic_confidence": round(semantic_confidence, 4),
         "decision": decision,
-        "reason": str(data.get("reason", ""))[:500] or "No reason provided by Qwen.",
+        "reason": reason,
         # Spec (Part 4) fields, additive:
         "is_utility_pole": is_utility_pole,
         "pole_type": pole_type,
@@ -329,17 +373,32 @@ class QwenVerifier(BaseVerifier):
         # verify() call) when a local checkpoint path is actually configured.
         # Never required to be present -- is_available()/verify() fall back
         # to Ollama/DashScope cleanly when it isn't.
+        local_checkpoint_exists = bool(
+            self.local_model_path and (
+                Path(self.local_model_path).exists() or _looks_like_hub_id(self.local_model_path)
+            )
+        )
+
         self._tvl_backend: Optional[Qwen3VLTransformersBackend] = None
-        if self.backend_preference in ("auto", "transformers") and self.local_model_path:
+        if (self.backend_preference == "transformers" and self.local_model_path) or (
+            self.backend_preference == "auto" and local_checkpoint_exists
+        ):
             self._tvl_backend = Qwen3VLTransformersBackend.get_singleton(
                 self.local_model_path, self.transformers_dtype, self.transformers_device_map,
             )
 
-        local_checkpoint_exists = bool(self.local_model_path and Path(self.local_model_path).exists())
-        self._status = "ready" if (
-            (self._tvl_backend is not None and local_checkpoint_exists) or self.ollama_model or self.api_key
-        ) else "unavailable"
-        self._error_msg = None if self._status == "ready" else (
+        # Distinguish between "a backend is configured and appears viable"
+        # vs "the model has actually been loaded and is ready for inference".
+        # Transformers backend uses lazy loading: checkpoint-exists means
+        # 'configured', not 'ready'.  Ollama/DashScope are stateless APIs
+        # that are always 'ready' once discovered/configured.
+        if self._tvl_backend is not None and local_checkpoint_exists:
+            self._status = "configured"  # checkpoint exists; model not yet loaded
+        elif self.backend_preference != "transformers" and (self.ollama_model or self.api_key):
+            self._status = "ready"  # stateless API backends are always ready
+        else:
+            self._status = "unavailable"
+        self._error_msg = None if self._status != "unavailable" else (
             f"No local Qwen3-VL-8B-Instruct checkpoint (QWEN_MODEL_PATH), vision-capable Qwen model "
             f"(a '...vl...' tag) found in Ollama at {self.ollama_base_url} -- a text-only Qwen model "
             "(e.g. qwen2.5-coder) does not count, since this verifier must look at an image crop -- "
@@ -348,7 +407,11 @@ class QwenVerifier(BaseVerifier):
         )
 
     def is_available(self) -> bool:
-        return self._status == "ready"
+        """True if any backend is configured and can potentially handle
+        a verify() call.  For the transformers backend this means the
+        checkpoint directory exists (the model loads lazily on first
+        verify() call)."""
+        return self._status in ("ready", "configured")
 
     def _load_pil(self, image: Union[str, np.ndarray, Image.Image]) -> Image.Image:
         if isinstance(image, (str, Path)):
@@ -494,10 +557,12 @@ class QwenVerifier(BaseVerifier):
             )
 
             raw = None
+            backend_used = None
             tvl_error: Optional[Exception] = None
             if self._tvl_backend is not None:
                 try:
                     raw = self._verify_via_transformers(tight_b64, context_b64, prompt)
+                    backend_used = "transformers"
                 except Exception as e:
                     tvl_error = e
                     if self.backend_preference == "transformers":
@@ -508,8 +573,10 @@ class QwenVerifier(BaseVerifier):
             if raw is None:
                 if self.ollama_model:
                     raw = self._verify_via_ollama(tight_b64, context_b64, prompt)
+                    backend_used = "ollama"
                 elif self.api_key:
                     raw = self._verify_via_dashscope(tight_b64, context_b64, prompt)
+                    backend_used = "dashscope"
                 elif tvl_error is not None:
                     raise tvl_error
                 else:
@@ -521,8 +588,14 @@ class QwenVerifier(BaseVerifier):
             # to the except block below.
             norm = _normalize_qwen_response(raw if isinstance(raw, dict) else {})
 
+            # Update adapter status to reflect actual model readiness
+            # after a successful transformers inference.
+            if backend_used == "transformers" and self._tvl_backend is not None:
+                self._status = self._tvl_backend._load_status
+
             return {
                 "status": "ok",
+                "backend_used": backend_used,
                 "class": norm["class"],
                 "material": norm["material"],
                 "visibility": norm["visibility"],
@@ -545,6 +618,7 @@ class QwenVerifier(BaseVerifier):
         except Exception as e:
             return {
                 "status": "error",
+                "backend_used": backend_used if 'backend_used' in dir() else None,
                 "decision": "review",
                 "needs_human_review": True,
                 "reason": f"Qwen verification error: {str(e)}",
@@ -557,18 +631,35 @@ class QwenVerifier(BaseVerifier):
             "pulled, set QWEN_MODEL_PATH to a local Qwen3-VL-8B-Instruct checkpoint for the "
             "Transformers backend, or set QWEN_API_KEY/DASHSCOPE_API_KEY for the cloud API."
         )
-        if self._tvl_backend is not None and self._tvl_backend.is_loaded():
+        if self._status == "unavailable":
+            return ModelInfo(
+                id="qwen_verifier",
+                name="Qwen VLM Verifier",
+                model_type="verifier",
+                status="unavailable",
+                weights_path=self.model_name if self.api_key else self.local_model_path,
+                device="cloud" if self.api_key else "cpu",
+                backend="dashscope" if self.api_key else (self.backend_preference if self.backend_preference == "transformers" else None),
+                error_message=self._error_msg,
+                installation_guide=install_guide,
+            )
+        if self._tvl_backend is not None:
             tvl_status = self._tvl_backend.get_status()
+            load_status = tvl_status.get("load_status", "configured")
+            # Report status accurately: 'ready' only when model is actually
+            # loaded, 'configured' when checkpoint exists but not yet loaded.
             return ModelInfo(
                 id="qwen_verifier",
                 name="Qwen3-VL-8B-Instruct",
                 model_type="verifier",
-                status="ready",
+                status=load_status,
                 weights_path=self._tvl_backend.model_path,
                 device=tvl_status["device"],
                 backend="transformers",
-                error_message=None,
-                installation_guide="Loaded locally via Hugging Face Transformers (device_map=auto).",
+                error_message=tvl_status.get("error"),
+                installation_guide="Loaded locally via Hugging Face Transformers (device_map=auto)." if load_status == "ready" else install_guide,
+                dtype=tvl_status.get("dtype"),
+                load_time_s=tvl_status.get("load_time_s"),
             )
         if self.ollama_model:
             return ModelInfo(

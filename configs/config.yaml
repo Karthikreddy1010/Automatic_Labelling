@@ -141,18 +141,16 @@ verification_pipeline:
     # "always" -- call Qwen on every surviving candidate regardless of gating,
     #             for A/B evaluation experiments (configs B/D).
     gating: "gated"
-    # Which Qwen backend to use. "auto" tries transformers (if
-    # transformers.model_path/QWEN_MODEL_PATH exists on disk), then a local
-    # Ollama server, then DashScope's cloud API -- first one available wins.
-    # Pin explicitly on HAWK once verified: "transformers".
-    backend: "auto"
+    # Which Qwen backend to use. Explicitly pinned to "transformers" for the
+    # H200 controlled-evaluation experiment -- no Ollama/DashScope fallback.
+    # "auto" tries transformers → Ollama → DashScope.
+    backend: "transformers"
     transformers:
-      # Local Qwen3-VL-8B-Instruct checkpoint directory (HAWK:
-      # /home/maska/models/Qwen3-VL-8B-Instruct). Falls back to the
-      # QWEN_MODEL_PATH env var if null. Never downloaded automatically --
-      # if this path doesn't exist locally, the transformers backend
-      # reports unavailable rather than fetching from the Hub.
-      model_path: null
+      # Local Qwen3-VL-8B-Instruct checkpoint directory (H200 deepthink).
+      # Falls back to the QWEN_MODEL_PATH env var if null. Never downloaded
+      # automatically -- if this path doesn't exist locally, the transformers
+      # backend reports unavailable rather than fetching from the Hub.
+      model_path: "/home/jovyan/models/Qwen3-VL-8B-Instruct"
       dtype: "bfloat16"
       device_map: "auto"
     # Expanded "context crop" sent alongside the tight candidate crop, as a

@@ -18,13 +18,17 @@ crop-building, prompt template, and response normalization.
 """
 
 from __future__ import annotations
+import logging
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 _SINGLETONS: Dict[str, "Qwen3VLTransformersBackend"] = {}
 _SINGLETON_LOCK = threading.Lock()
@@ -67,6 +71,10 @@ class Qwen3VLTransformersBackend:
         self._loaded = False
         self._error: Optional[str] = None
         self._resolved_device: Optional[str] = None
+        self._resolved_dtype_name: Optional[str] = None
+        self._load_time_s: Optional[float] = None
+        # Load status lifecycle: configured → loading → ready / error
+        self._load_status: str = "configured"
 
     @classmethod
     def get_singleton(cls, model_path: str, dtype: str = "bfloat16", device_map: str = "auto") -> "Qwen3VLTransformersBackend":
@@ -88,6 +96,10 @@ class Qwen3VLTransformersBackend:
     def load(self) -> bool:
         if self.is_loaded():
             return True
+        self._load_status = "loading"
+        logger.info("Qwen3-VL-8B-Instruct: loading from '%s' (dtype=%s, device_map=%s)...",
+                     self.model_path, self.dtype_name, self.device_map)
+        t0 = time.monotonic()
         try:
             if not self.model_path:
                 self._error = (
@@ -96,6 +108,7 @@ class Qwen3VLTransformersBackend:
                     "either a local checkpoint directory or a Hugging Face Hub id "
                     "(e.g. 'Qwen/Qwen3-VL-8B-Instruct') already cached locally."
                 )
+                self._load_status = "error"
                 return False
 
             # A literal filesystem path is pre-checked for existence so a
@@ -114,15 +127,19 @@ class Qwen3VLTransformersBackend:
                     "verification_pipeline.qwen.transformers.model_path (or QWEN_MODEL_PATH) "
                     "at a local checkpoint directory, or a Hugging Face Hub id already cached locally."
                 )
+                self._load_status = "error"
                 return False
 
             import torch
             from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
             resolved_dtype = self._resolve_dtype(torch)
+            self._resolved_dtype_name = str(resolved_dtype).replace("torch.", "")
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
             self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
+            # NOTE: `dtype=` is the correct keyword for Transformers >= 4.56.0
+            # (torch_dtype was deprecated). Confirmed for Transformers 5.18.0.dev0.
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_path,
                 dtype=resolved_dtype,
@@ -130,27 +147,88 @@ class Qwen3VLTransformersBackend:
                 local_files_only=True,
             ).eval()
 
-            self._resolved_device = str(next(self.model.parameters()).device) if hasattr(self.model, "parameters") else self.device_map
+            # Resolve the actual device the model parameters ended up on.
+            # With device_map="auto" on a single GPU, all parameters should
+            # be on the same CUDA device. For dispatched multi-GPU models,
+            # hf_device_map provides the authoritative mapping.
+            self._resolved_device = self._detect_model_device()
             self._loaded = True
             self._error = None
+            self._load_status = "ready"
+            self._load_time_s = time.monotonic() - t0
+
+            # Log successful load telemetry
+            cuda_mem_info = self._get_cuda_memory_info()
+            logger.info(
+                "Qwen3-VL-8B-Instruct: loaded successfully in %.2fs | "
+                "backend=transformers | model_path=%s | device=%s | dtype=%s%s",
+                self._load_time_s, self.model_path, self._resolved_device,
+                self._resolved_dtype_name,
+                (f" | cuda_allocated_mb={cuda_mem_info.get('allocated_mb')}"
+                 f" | cuda_peak_mb={cuda_mem_info.get('peak_mb')}"
+                 if cuda_mem_info else ""),
+            )
             return True
         except Exception as e:
             self._error = f"Failed to load Qwen3-VL-8B-Instruct from '{self.model_path}': {e}"
             self.model = None
             self.processor = None
             self._loaded = False
+            self._load_status = "error"
+            self._load_time_s = time.monotonic() - t0
+            logger.error("Qwen3-VL-8B-Instruct: load FAILED in %.2fs: %s",
+                         self._load_time_s, self._error)
             return False
 
     def unload(self) -> None:
         self.model = None
         self.processor = None
         self._loaded = False
+        self._load_status = "configured"
+        self._resolved_device = None
+        self._resolved_dtype_name = None
+        self._load_time_s = None
         try:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+    def _detect_model_device(self) -> str:
+        """Determine the primary device the model is running on.
+
+        For single-GPU setups (the H200 case), model.device or the device of
+        the first parameter is sufficient. For multi-GPU dispatched models,
+        hf_device_map is checked. Returns a string like 'cuda:0' or 'cpu'.
+        """
+        if self.model is None:
+            return self.device_map
+        # Dispatched models (Accelerate) expose hf_device_map
+        if hasattr(self.model, "hf_device_map") and self.model.hf_device_map:
+            devices = set(str(d) for d in self.model.hf_device_map.values())
+            cuda_devices = [d for d in devices if "cuda" in d]
+            if cuda_devices:
+                return cuda_devices[0]  # primary CUDA device
+            return next(iter(devices), self.device_map)
+        # Fallback: first parameter's device
+        try:
+            return str(next(self.model.parameters()).device)
+        except StopIteration:
+            return self.device_map
+
+    def _get_input_device(self):
+        """Return the torch.device to use for model inputs.
+
+        For dispatched models, inputs should be placed on the device of the
+        first module in the execution graph. Using model.device is the
+        canonical approach recommended by the Qwen3-VL documentation.
+        """
+        if self.model is None:
+            return "cpu"
+        # model.device works for both single-device and dispatched models
+        # in the current Transformers + Accelerate stack.
+        return self.model.device
 
     def _resolve_dtype(self, torch_module):
         """bfloat16 when supported, otherwise a safe fallback -- never crashes
@@ -164,6 +242,20 @@ class Qwen3VLTransformersBackend:
             except Exception:
                 return torch_module.float32
         return getattr(torch_module, requested, torch_module.float32)
+
+    def _get_cuda_memory_info(self) -> Optional[Dict[str, Any]]:
+        """Return CUDA memory stats if CUDA is available, else None."""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return None
+            return {
+                "allocated_mb": round(torch.cuda.memory_allocated() / (1024 * 1024), 1),
+                "peak_mb": round(torch.cuda.max_memory_allocated() / (1024 * 1024), 1),
+                "reserved_mb": round(torch.cuda.memory_reserved() / (1024 * 1024), 1),
+            }
+        except Exception:
+            return None
 
     def generate_json(self, images: List[Image.Image], prompt: str, max_new_tokens: int = 512) -> str:
         """
@@ -179,6 +271,8 @@ class Qwen3VLTransformersBackend:
             )
         import torch
 
+        t0 = time.monotonic()
+
         content = [{"type": "image", "image": img} for img in images]
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
@@ -186,7 +280,13 @@ class Qwen3VLTransformersBackend:
         inputs = self.processor.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",
         )
-        inputs = {k: v.to(self.model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        # Move all tensor inputs to the model's primary device.
+        # model.device is the canonical approach for Qwen3-VL as confirmed
+        # by official documentation, and works correctly for both single-GPU
+        # and device_map="auto" dispatched models.
+        input_device = self._get_input_device()
+        inputs = {k: v.to(input_device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
         with torch.inference_mode():
             output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -194,13 +294,28 @@ class Qwen3VLTransformersBackend:
         input_len = inputs["input_ids"].shape[1]
         generated = output_ids[:, input_len:]
         text = self.processor.batch_decode(generated, skip_special_tokens=True)[0]
+
+        inference_time = time.monotonic() - t0
+        cuda_mem = self._get_cuda_memory_info()
+        logger.info(
+            "Qwen3-VL inference completed in %.2fs | device=%s | dtype=%s%s",
+            inference_time, self._resolved_device, self._resolved_dtype_name,
+            (f" | cuda_peak_mb={cuda_mem.get('peak_mb')}" if cuda_mem else ""),
+        )
+
         return text
 
     def get_status(self) -> Dict[str, Any]:
+        cuda_mem = self._get_cuda_memory_info() if self.is_loaded() else None
         return {
             "available": self.is_loaded(),
+            "load_status": self._load_status,
             "model": "Qwen3-VL-8B-Instruct",
             "backend": "transformers",
+            "model_path": self.model_path,
             "device": self._resolved_device or self.device_map,
+            "dtype": self._resolved_dtype_name or self.dtype_name,
+            "load_time_s": round(self._load_time_s, 2) if self._load_time_s is not None else None,
             "error": self._error,
+            "cuda_memory": cuda_mem,
         }

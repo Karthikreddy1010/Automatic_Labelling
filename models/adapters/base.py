@@ -129,12 +129,14 @@ class ModelInfo:
     id: str
     name: str
     model_type: str  # "detector", "segmenter", "vlm", "ensemble"
-    status: str      # "ready", "not_loaded", "unavailable", "missing_weights"
+    status: str      # "ready", "configured", "loading", "not_loaded", "unavailable", "error", "missing_weights"
     weights_path: Optional[str] = None
     device: str = "cpu"
     error_message: Optional[str] = None
     installation_guide: Optional[str] = None
     backend: Optional[str] = None  # e.g. "transformers", "sam3_http", "ollama:qwen3-vl:2b"
+    dtype: Optional[str] = None  # e.g. "bfloat16", "float16", "float32"
+    load_time_s: Optional[float] = None  # model load time in seconds
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -147,6 +149,8 @@ class ModelInfo:
             "error_message": self.error_message,
             "installation_guide": self.installation_guide,
             "backend": self.backend,
+            "dtype": self.dtype,
+            "load_time_s": self.load_time_s,
         }
 
 

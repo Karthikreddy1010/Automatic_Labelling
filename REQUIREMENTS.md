@@ -6,9 +6,10 @@
 > the **current, actual** implementation — not an aspirational target — so it
 > should be updated whenever a requirement changes, not treated as frozen.
 >
-> **Note:** [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md)
-> have been updated to match the pipeline described in section 2.2 below.
-> [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) describes a separate, older
+> **Note:** [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and
+> this document reflect the current multi-stage pipeline (SAM 3 refinement
+> preference, isolated SAM 3 microservice, and multi-backend Qwen3-VL
+> verifier). [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) describes a separate, older
 > pipeline (see [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) section 6) and
 > is intentionally left as-is.
 
@@ -41,14 +42,18 @@ Given an image, the system MUST produce candidate OBBs via the following
 pipeline (`backend/app.py::run_ai_pipeline`, modes `AI_LABEL`/`DINO_SAM`):
 
 1. **Candidate proposal**: Grounding DINO (open-vocabulary text-prompted
-   detection) and, if available, SAM 3 (joint open-vocabulary detect+segment)
-   each propose candidate boxes independently.
+   detection) proposes candidate boxes. SAM 3 open-vocabulary detection is also
+   supported as an additional proposer via
+   `verification_pipeline.sam3.enable_candidate_proposal` (default: `False` to
+   avoid redundant SAM calls during production inference).
 2. **Deduplication**: candidates are merged by IoU clustering
    (`models/adapters/quality.py::dedup_by_iou`) so one physical pole does not
    produce multiple overlapping candidates.
 3. **Segmentation refinement**: up to `SAM_REFINE_TOP_N` (5) highest-confidence
-   deduped candidates are segmented with SAM 2.1 (or SAM 3 as fallback) into a
-   precise mask, from which a canonical 4-corner OBB is generated.
+   deduped candidates are segmented into precise masks, from which canonical
+   4-corner OBBs are generated. **SAM 3** is preferred for refinement (via
+   direct in-process inference or the isolated HTTP microservice); SAM 2.1 is
+   used as a fallback when SAM 3 is unavailable.
 4. **OBB structural validation** (`models/adapters/obb_generator.py`): every
    generated OBB MUST have exactly 4 corners, all in-bounds, non-self-
    intersecting, positive area — invalid OBBs are dropped, never persisted.
@@ -62,13 +67,21 @@ pipeline (`backend/app.py::run_ai_pipeline`, modes `AI_LABEL`/`DINO_SAM`):
    `geometry_status` (`pass`/`warning`/`fail`). Configurable thresholds
    (`configs/config.yaml`, `verification_pipeline.geometry_qa`) — no single
    hard-coded global threshold.
-7. **Semantic verification** (`models/adapters/qwen_adapter.py`): a Qwen
-   vision-language model (local Ollama, preferred, or DashScope cloud API)
-   classifies the candidate crop (`class`, `material`, `visibility`,
-   `orientation`, `semantic_confidence`) and is gated (`off`/`gated`/`always`,
+7. **Semantic verification** (`models/adapters/qwen_adapter.py`,
+   `models/adapters/qwen3vl_transformers_backend.py`): a Qwen vision-language
+   model evaluates both a tight candidate crop and an expanded context crop
+   (configurable expansion factor, default 1.6). Supports three backends
+   configured via `verification_pipeline.qwen.backend`:
+   - `transformers`: local in-process `Qwen3-VL-8B-Instruct` via Hugging Face
+     Transformers (`bfloat16`/`float16`, `device_map="auto"`, singleton-cached).
+   - `ollama`: local Ollama server auto-discovering vision-capable Qwen models.
+   - `dashscope`: DashScope cloud API fallback (requires `DASHSCOPE_API_KEY`).
+   Classifies candidate attributes (`class`, `material`, `visibility`,
+   `orientation`, `semantic_confidence`, `is_utility_pole`, `pole_type`,
+   `confidence_rating`, `flags`, `issues`), detects cross-signal contradictions,
+   and reports `backend_used`. Semantic verification is gated (`off`/`gated`/`always`,
    configurable per-request or via `verification_pipeline.qwen.gating`) to
-   avoid calling it on candidates an earlier stage already confidently
-   rejects.
+   avoid calling it on candidates an earlier stage already confidently rejects.
 8. **Decision engine** (`models/adapters/decision_engine.py`): combines
    detection/segmentation/geometry/semantic scores (configurable weights,
    `verification_pipeline.decision.weights`) into one `final_score` and an
@@ -76,6 +89,9 @@ pipeline (`backend/app.py::run_ai_pipeline`, modes `AI_LABEL`/`DINO_SAM`):
    disagreement detection. `REJECT` candidates are dropped; `ACCEPT`/`REVIEW`
    are persisted to `predictions/` and shown to the reviewer, flagged
    `needs_review` unless `ACCEPT`.
+9. **Instrumentation & Telemetry**: Pipeline execution records per-stage latencies
+   in `raw_outputs["timings_ms"]` and candidate count aggregates in
+   `raw_outputs["summary"]`.
 
 `DINO_ONLY` mode exposes step 1–2 output without refinement, for inspection.
 
@@ -94,10 +110,12 @@ pipeline (`backend/app.py::run_ai_pipeline`, modes `AI_LABEL`/`DINO_SAM`):
 - Per-candidate inspector showing source, confidence, decision, final/
   geometry/segmentation scores, Qwen classification (when it ran), and
   review reasons.
-- Accept (verify as-is), Save Edits (persist human corrections), Reject
-  (mark false positive, with failure-type/negative-category), Remove All
-  Labels (current image only — clears locally, requires explicit Save to
-  persist).
+- Action set:
+  - **Accept**: verify candidate as-is.
+  - **Save Edits**: persist human-modified bounding boxes.
+  - **Reject**: mark false positive with failure-type and negative-category metadata.
+  - **Skip**: advance to next image without verifying or rejecting current predictions.
+  - **Remove All Labels**: current image only — clears locally, requires explicit Save to persist.
 - Client-side validation before every save: reject degenerate/malformed
   boxes, clamp out-of-frame corners to image bounds rather than silently
   rejecting a legitimately frame-cut-off pole.
@@ -140,9 +158,12 @@ pipeline (`backend/app.py::run_ai_pipeline`, modes `AI_LABEL`/`DINO_SAM`):
 ### 2.8 System & Model Status
 - Hardware inspection (CPU/CUDA, device switching AUTO/CUDA/CPU) without
   fabricating GPU telemetry when CUDA is unavailable.
-- Per-model status (`ready`/`not_loaded`/`unavailable`/`missing_weights`)
-  with a human-readable installation guide when unavailable — never a mocked
+- Per-model status lifecycle (`ready`, `configured` [checkpoint present on disk,
+  lazy load pending], `loading`, `not_loaded`, `unavailable`, `error`,
+  `missing_weights`) with human-readable installation guidance — never a mocked
   "ready" state.
+- Model telemetry reporting: surfaces active backend, precision `dtype`
+  (`bfloat16`/`float16`/`float32`), and measured `load_time_s`.
 - Read-only view of the loaded verification-pipeline configuration
   (`/api/config/verification_pipeline`).
 
@@ -167,6 +188,10 @@ pipeline (`backend/app.py::run_ai_pipeline`, modes `AI_LABEL`/`DINO_SAM`):
   SAM down for `AI_LABEL`), the pipeline MUST return a clear
   `raw_outputs["error"]` (surfaced as HTTP 503) — never silently substitute
   another detector or return an empty "no poles found" result.
+- When a verifier backend is explicitly configured/pinned (e.g.
+  `verification_pipeline.qwen.backend: "transformers"`), backend failures MUST
+  raise or report error status rather than silently falling back to alternative
+  backends (such as Ollama or DashScope).
 - A malformed or unparseable Qwen response is normalized to safe defaults
   (`class: "uncertain"`, etc.) and never crashes the pipeline, but is never
   treated as a confident judgment either.
@@ -214,11 +239,11 @@ pipeline (`backend/app.py::run_ai_pipeline`, modes `AI_LABEL`/`DINO_SAM`):
   `/api/...` path, so it continues to work when served from a sub-path (a
   JupyterHub `/proxy/` or VS Code Server `/vscode/proxy/` prefix), not only
   at domain root.
-- No change may require installing new Python packages, upgrading a pinned
-  major dependency version (e.g. `transformers` 4.x → 5.x), reinstalling
-  PyTorch, or creating a new environment without explicit user approval
-  first — see section 6 for the current SAM3/`transformers` gap this
-  constraint is blocking.
+- Upgrading in-process major dependency versions (e.g. `transformers` 4.x → 5.x)
+  is constrained to avoid breaking Grounding DINO or SAM 2.1. When incompatible
+  model dependencies arise (such as SAM 3 requiring `transformers>=5.9`), they
+  MUST be decoupled into standalone microservices (e.g. `services/sam3_service.py`)
+  communicating over HTTP rather than destabilizing the primary application environment.
 
 ### 3.7 Testing
 - New pipeline logic (geometry QA, decision engine, OBB validation, Qwen
@@ -252,26 +277,32 @@ invariant, positive signed shoelace area).
 
 ## 5. External Dependencies & Environment Requirements
 
-- Python 3.13, PyTorch, `transformers` (pinned `==4.57.0`; see section 6 for
-  the SAM3 gap this creates), FastAPI/uvicorn, OpenCV, Shapely (used by
-  `src/geometry_obb.py` and `models/adapters/obb_generator.py`), PyYAML.
+- Python 3.13, PyTorch, `transformers` (pinned `==4.57.0`), `accelerate`,
+  FastAPI/uvicorn, OpenCV, Shapely (used by `src/geometry_obb.py` and
+  `models/adapters/obb_generator.py`), PyYAML, Pydantic, Albumentations.
   `requirements.txt` pins exact versions verified working in the current
-  dev environment rather than loose lower bounds; `tensorflow`,
-  `pycocotools`, `gsvmaps`, and `label-studio-converter` were removed from it
-  as confirmed-unused leftovers from an earlier pipeline.
+  dev environment (checked 2026-09-11) rather than loose lower bounds;
+  `tensorflow`, `pycocotools`, `gsvmaps`, and `label-studio-converter` were
+  removed as confirmed-unused leftovers from an earlier pipeline.
 - Grounding DINO, SAM 2.1: require `transformers` and, for first download,
   `POLE_ALLOW_ONLINE=1`.
-- SAM 3: requires `transformers>=5.9` (`Sam3Model`/`Sam3Processor`) — **not
-  met by the currently pinned/installed version**; the adapter degrades
-  gracefully (`is_available()` returns `False`, reported honestly via
-  `/api/models/status`) rather than crashing.
-- Qwen verification: either a local Ollama server (preferred — auto-
-  discovers the smallest vision-capable `qwen*vl*` model pulled, or a
-  `QWEN_OLLAMA_MODEL`-pinned one) or `QWEN_API_KEY`/`DASHSCOPE_API_KEY` for
-  the DashScope cloud API. CPU-only inference on an 8B+ VLM is impractically
-  slow (empirically 5+ minutes per crop) — a GPU (e.g. the DeepThink H200
-  target) or a smaller local model (2B/4B) is required for practical
-  interactive use; `QWEN_OLLAMA_TIMEOUT_S` (default 300s) is tunable per
+- SAM 3: supports two deployment modes via `verification_pipeline.sam3.backend`:
+  1. `inprocess`: requires `transformers>=5.9` (`Sam3Model`/`Sam3Processor`).
+  2. `http` / `sam3_http`: isolated HTTP microservice (`services/sam3_service.py`,
+     `models/adapters/sam3_http_adapter.py`, `deploy/hawk_start_sam3_service.sh`),
+     running in a separate environment or container. Resolves the `transformers`
+     4.x vs 5.x version conflict without breaking the main application environment.
+- Qwen verification: supports three selectable backends via
+  `verification_pipeline.qwen.backend`:
+  1. `transformers`: direct local Hugging Face Transformers execution of
+     `Qwen3-VL-8B-Instruct` (`models/adapters/qwen3vl_transformers_backend.py`),
+     requiring `accelerate`, running in `bfloat16`/`float16` with `device_map="auto"`.
+     Uses a local checkpoint directory or cached Hugging Face Hub ID.
+  2. `ollama`: local Ollama server auto-discovering vision-capable models.
+  3. `dashscope`: DashScope cloud API fallback (requires `DASHSCOPE_API_KEY`).
+  CPU-only inference on an 8B+ VLM is impractically slow (empirically 5+ minutes
+  per crop) — a GPU (e.g. H200/A100 target) or a smaller local model is required
+  for interactive use; `QWEN_OLLAMA_TIMEOUT_S` (default 300s) is tunable per
   environment.
 - No hardware GPU is required for the app to run — every stage degrades to
   CPU or reports `unavailable`/`error` rather than requiring CUDA.
@@ -281,17 +312,18 @@ invariant, positive signed shoelace area).
 - **Dataset-wide "clear all labels"**: explicitly not built (scoped out by
   the user); only per-image clearing exists.
 - **True precision/recall**: not computable without human-verified ground
-  truth for the images in question. `benchmark_dino_sam.py --ground-truth-
-  dir` is implemented and ready, but no such ground-truth set currently
-  exists locally.
-- **SAM3 on this machine**: blocked on a `transformers` major-version
-  upgrade (4.x → 5.x) that has not been approved (constraint 3.6). Until
-  then, SAM3 contributes zero candidates and DINO alone proposes them.
-- **Qwen semantic-verification quality**: integration verified working
-  end-to-end against a real local Ollama model, but the smallest (2B) local
-  model's actual judgment quality is unverified/suspect (observed near-
-  identical templated responses across different crops in manual testing) —
-  not yet validated as a trustworthy signal on its own.
+  truth for the images in question. `benchmark_dino_sam.py --ground-truth-dir`
+  is implemented and ready, but no such ground-truth set currently exists
+  locally.
+- **SAM 3 local in-process execution**: in-process SAM 3 remains blocked on a
+  local `transformers` major-version upgrade (4.x → 5.x). The isolated HTTP
+  microservice architecture (`sam3_http`) resolves this gap on cluster
+  deployments without modifying the local environment's pinned dependencies.
+- **Qwen semantic-verification quality**: the smallest (2B) local Ollama model's
+  judgment quality is unverified/suspect (observed near-identical templated
+  responses across different crops in manual testing). The direct Hugging Face
+  Transformers backend for `Qwen3-VL-8B-Instruct` provides the full-parameter
+  production alternative for GPU environments.
 - **Multi-tenancy, dataset versioning, model training/deployment UI**: not
   part of this system; it produces a YOLO-OBB dataset for training
   elsewhere.
@@ -307,6 +339,10 @@ invariant, positive signed shoelace area).
 | `geometry_score` / `geometry_status` | Independent mask/OBB shape-plausibility signal (`geometry_qa.py`). `pass`/`warning`/`fail`. |
 | `segmentation_score` | SAM-mask-quality signal used by the decision engine, deliberately independent of DINO confidence (reuses `quality.py`'s geometry/overlap sub-signals, not its DINO-blended `quality_score`). |
 | `semantic_confidence` | Qwen's self-reported confidence in its classification of a candidate crop. |
+| `is_utility_pole` | Boolean verification flag from Qwen indicating whether the crop depicts an electric utility pole. |
+| `pole_type` | Specific pole categorization from Qwen (`distribution_pole`, `transmission_pole`, `light_pole`, `not_a_pole`, `unknown`). |
 | `final_score` | Decision engine's weighted combination of the above (weights renormalized over whichever signals actually ran). |
 | `decision` | `ACCEPT` / `REVIEW` / `REJECT` — the decision engine's output; advisory, always human-overridable via the normal edit/Accept/Reject flow. |
 | `needs_review` | Per-candidate flag; `True` unless `decision == ACCEPT` (or, for pre-decision-engine modes, unless quality/confidence clears their own bar). |
+| `timings_ms` | Millisecond execution time breakdown per pipeline stage (`dino`, `sam3_propose`, `sam_refine`, `geometry_qa`, `qwen`, `decision_engine`). |
+| `backend_used` | Name of the backend engine that executed inference (e.g. `transformers`, `ollama`, `dashscope`, `sam3_http`). |

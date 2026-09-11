@@ -18,7 +18,10 @@ import os
 import time
 import asyncio
 import threading
+import logging
 from pathlib import Path
+
+logger = logging.getLogger("backend.app")
 from typing import List, Dict, Any, Optional, Union, Tuple
 from contextlib import asynccontextmanager
 
@@ -1053,20 +1056,24 @@ def detect_single_image(req: DetectionRequest):
         raise HTTPException(status_code=404, detail="Image not found in dataset.")
 
     resolved_dev, _ = detect_hardware(active_device)
-    reconciled, raw_outputs = run_ai_pipeline(
-        img_path=img_path,
-        mode=req.mode,
-        conf_threshold=req.conf_threshold,
-        iou_threshold=req.iou_threshold,
-        use_sam_refinement=req.use_sam_refinement,
-        device=resolved_dev,
-        dataset_id=req.dataset_id,
-        filename=req.filename,
-        text_threshold=req.text_threshold,
-        max_candidates=req.max_candidates,
-        enable_geometry_qa=req.enable_geometry_qa,
-        qwen_gating=req.qwen_gating,
-    )
+    try:
+        reconciled, raw_outputs = run_ai_pipeline(
+            img_path=img_path,
+            mode=req.mode,
+            conf_threshold=req.conf_threshold,
+            iou_threshold=req.iou_threshold,
+            use_sam_refinement=req.use_sam_refinement,
+            device=resolved_dev,
+            dataset_id=req.dataset_id,
+            filename=req.filename,
+            text_threshold=req.text_threshold,
+            max_candidates=req.max_candidates,
+            enable_geometry_qa=req.enable_geometry_qa,
+            qwen_gating=req.qwen_gating,
+        )
+    except Exception as exc:
+        logger.exception("Inference pipeline failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Inference pipeline failed: {exc}")
 
     if raw_outputs.get("error"):
         # A required model is unavailable -- surface it clearly rather than

@@ -105,5 +105,102 @@ class TestQwen3VLTransformersBackend(unittest.TestCase):
         self.assertNotIn("does not exist", error)
 
 
+class TestLoadStatusLifecycle(unittest.TestCase):
+    """Load status must follow the lifecycle: configured → loading → ready/error."""
+
+    def test_initial_status_is_configured(self):
+        backend = Qwen3VLTransformersBackend(model_path="/some/path")
+        self.assertEqual(backend._load_status, "configured")
+        status = backend.get_status()
+        self.assertEqual(status["load_status"], "configured")
+
+    def test_failed_load_transitions_to_error(self):
+        backend = Qwen3VLTransformersBackend(model_path="/nonexistent/path")
+        backend.load()
+        self.assertEqual(backend._load_status, "error")
+        status = backend.get_status()
+        self.assertEqual(status["load_status"], "error")
+        self.assertIsNotNone(status["error"])
+
+    def test_empty_model_path_transitions_to_error(self):
+        backend = Qwen3VLTransformersBackend(model_path="")
+        backend.load()
+        self.assertEqual(backend._load_status, "error")
+
+    def test_unload_resets_to_configured(self):
+        backend = Qwen3VLTransformersBackend(model_path="/some/path")
+        backend.load()  # will fail but transitions to error
+        backend.unload()
+        self.assertEqual(backend._load_status, "configured")
+
+
+class TestGetStatusFields(unittest.TestCase):
+    """get_status() must expose all expected telemetry fields."""
+
+    def test_get_status_contains_all_required_fields(self):
+        backend = Qwen3VLTransformersBackend(model_path="/some/path")
+        status = backend.get_status()
+        # Required fields
+        for key in ("available", "load_status", "model", "backend", "model_path",
+                     "device", "dtype", "load_time_s", "error", "cuda_memory"):
+            self.assertIn(key, status, f"Missing field: {key}")
+
+    def test_get_status_backend_is_transformers(self):
+        backend = Qwen3VLTransformersBackend(model_path="/some/path")
+        self.assertEqual(backend.get_status()["backend"], "transformers")
+
+    def test_get_status_model_path_preserved(self):
+        path = "/home/jovyan/models/Qwen3-VL-8B-Instruct"
+        backend = Qwen3VLTransformersBackend(model_path=path)
+        self.assertEqual(backend.get_status()["model_path"], path)
+
+    def test_get_status_dtype_defaults_to_requested(self):
+        backend = Qwen3VLTransformersBackend(model_path="/some/path", dtype="bfloat16")
+        self.assertEqual(backend.get_status()["dtype"], "bfloat16")
+
+    def test_get_status_load_time_none_before_load(self):
+        backend = Qwen3VLTransformersBackend(model_path="/some/path")
+        self.assertIsNone(backend.get_status()["load_time_s"])
+
+
+class TestNoOllamaFallbackWhenTransformersExplicit(unittest.TestCase):
+    """When backend='transformers' is explicitly configured, a failed
+    transformers load/inference must NOT silently fall back to Ollama/DashScope."""
+
+    def test_transformers_failure_raises_not_falls_back(self):
+        from unittest.mock import patch, MagicMock
+        from models.adapters.qwen_adapter import QwenVerifier
+        from models.adapters.base import DetectionBox
+
+        verifier = QwenVerifier(
+            api_key="dummy_key_should_not_be_used",
+            local_model_path="/nonexistent/path",
+            ollama_base_url="http://127.0.0.1:1",
+            backend="transformers",
+        )
+        # Force the internal state to simulate transformers being selected
+        verifier._status = "configured"
+        verifier._tvl_backend = MagicMock()
+        verifier._tvl_backend.is_loaded.return_value = False
+        verifier._tvl_backend.load.return_value = False
+        verifier._tvl_backend.get_status.return_value = {"error": "test error"}
+
+        det = DetectionBox(
+            xyxy=(10.0, 20.0, 50.0, 200.0), corners=None,
+            confidence=0.85, model_source="DINO+SAM",
+        )
+        # Should return error, not silently use ollama/dashscope
+        import numpy as np
+        result = verifier.verify(
+            np.zeros((200, 200, 3), dtype=np.uint8), det
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(result["needs_human_review"])
+        # Verify ollama was NOT called
+        self.assertNotEqual(result.get("backend_used"), "ollama")
+        self.assertNotEqual(result.get("backend_used"), "dashscope")
+
+
 if __name__ == "__main__":
     unittest.main()
+

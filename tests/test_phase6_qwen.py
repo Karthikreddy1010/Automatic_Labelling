@@ -235,5 +235,188 @@ class TestQwenExtendedSchema(unittest.TestCase):
                                  tight_img.size[0] * tight_img.size[1])
 
 
+class TestContradictionDetection(unittest.TestCase):
+    """Contradictory semantic fields from Qwen must NEVER produce an automatic
+    ACCEPT. The normalizer must detect conflicts and force decision='review'."""
+
+    def test_case_a_is_utility_pole_true_but_class_tree(self):
+        """is_utility_pole=true + class=tree → must be review, NEVER accept."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": True,
+            "class": "tree",
+            "annotation_suitable": True,
+            "decision": "accept",
+            "confidence": 0.9,
+        })
+        self.assertEqual(norm["decision"], "review")
+        self.assertNotEqual(norm["decision"], "accept")
+        self.assertFalse(norm["annotation_suitable"])
+        self.assertIn("Contradictory", norm["reason"])
+
+    def test_case_a_is_utility_pole_true_but_class_building(self):
+        """is_utility_pole=true + class=building_or_structure → review."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": True,
+            "class": "building_or_structure",
+            "annotation_suitable": True,
+            "decision": "accept",
+        })
+        self.assertEqual(norm["decision"], "review")
+        self.assertIn("Contradictory", norm["reason"])
+
+    def test_case_a_is_utility_pole_true_but_class_non_utility_pole(self):
+        """is_utility_pole=true + class=non_utility_pole → review."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": True,
+            "class": "non_utility_pole",
+            "decision": "accept",
+        })
+        self.assertEqual(norm["decision"], "review")
+
+    def test_case_a_is_utility_pole_true_but_class_street_light(self):
+        """is_utility_pole=true + class=street_light_or_lamp_post → review."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": True,
+            "class": "street_light_or_lamp_post",
+            "annotation_suitable": True,
+        })
+        self.assertEqual(norm["decision"], "review")
+
+    def test_case_b_is_utility_pole_false_but_class_electric_utility_pole(self):
+        """is_utility_pole=false + class=electric_utility_pole → review."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": False,
+            "class": "electric_utility_pole",
+            "annotation_suitable": True,
+            "decision": "accept",
+        })
+        self.assertEqual(norm["decision"], "review")
+        self.assertIn("Contradictory", norm["reason"])
+
+    def test_case_c_annotation_suitable_true_but_decision_reject(self):
+        """annotation_suitable=true + decision=reject → review."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": True,
+            "class": "electric_utility_pole",
+            "annotation_suitable": True,
+            "decision": "reject",
+            "confidence": 0.8,
+        })
+        self.assertEqual(norm["decision"], "review")
+        self.assertIn("Contradictory", norm["reason"])
+
+    def test_case_d_decision_accept_but_class_tree(self):
+        """decision=accept but class=tree → review."""
+        norm = _normalize_qwen_response({
+            "class": "tree",
+            "decision": "accept",
+            "confidence": 0.7,
+        })
+        self.assertEqual(norm["decision"], "review")
+        self.assertIn("Contradictory", norm["reason"])
+
+    def test_no_contradiction_when_consistent_pole(self):
+        """Consistent pole classification should pass through normally."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": True,
+            "class": "electric_utility_pole",
+            "annotation_suitable": True,
+            "decision": "accept",
+            "confidence": 0.9,
+        })
+        self.assertEqual(norm["decision"], "accept")
+        self.assertNotIn("Contradictory", norm["reason"])
+
+    def test_no_contradiction_when_consistent_non_pole(self):
+        """Consistent non-pole classification should pass through normally."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": False,
+            "class": "tree",
+            "annotation_suitable": False,
+            "decision": "reject",
+            "confidence": 0.85,
+        })
+        self.assertEqual(norm["decision"], "reject")
+        self.assertNotIn("Contradictory", norm["reason"])
+
+    def test_multiple_contradictions_all_detected(self):
+        """Multiple contradictions should all appear in the reason."""
+        norm = _normalize_qwen_response({
+            "is_utility_pole": True,
+            "class": "tree",
+            "annotation_suitable": True,
+            "decision": "accept",
+        })
+        self.assertEqual(norm["decision"], "review")
+        # Should detect both is_utility_pole/class contradiction AND decision/class
+        self.assertIn("Contradictory", norm["reason"])
+
+
+class TestAdditionalFailureCases(unittest.TestCase):
+    """Additional edge cases for malformed Qwen responses."""
+
+    def test_confidence_none_falls_back(self):
+        norm = _normalize_qwen_response({"confidence": None})
+        self.assertEqual(norm["semantic_confidence"], 0.5)
+
+    def test_confidence_empty_string_falls_back(self):
+        norm = _normalize_qwen_response({"confidence": ""})
+        self.assertEqual(norm["semantic_confidence"], 0.5)
+
+    def test_confidence_malformed_numeric_string(self):
+        norm = _normalize_qwen_response({"confidence": "0.9abc"})
+        self.assertEqual(norm["semantic_confidence"], 0.5)
+
+    def test_decision_missing_defaults_to_review(self):
+        norm = _normalize_qwen_response({"class": "electric_utility_pole"})
+        self.assertEqual(norm["decision"], "review")
+
+    def test_invalid_decision_defaults_to_review(self):
+        norm = _normalize_qwen_response({"decision": "maybe_accept"})
+        self.assertEqual(norm["decision"], "review")
+
+    def test_decision_true_boolean_defaults_to_review(self):
+        norm = _normalize_qwen_response({"decision": True})
+        self.assertEqual(norm["decision"], "review")
+
+
+class TestQwenVerifierStatus(unittest.TestCase):
+    """Verify that QwenVerifier correctly distinguishes 'configured' from 'ready'."""
+
+    def test_transformers_backend_initially_configured_not_ready(self):
+        """When a local model path exists, status should be 'configured' not 'ready'
+        until the model actually loads."""
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmpdir:
+            verifier = QwenVerifier(
+                api_key=None,
+                local_model_path=tmpdir,  # exists but not a real model
+                ollama_base_url=UNREACHABLE_OLLAMA_URL,
+                backend="transformers",
+            )
+            # is_available should be True (checkpoint exists)
+            self.assertTrue(verifier.is_available())
+            # But status should NOT be 'ready' since model isn't loaded
+            info = verifier.get_info()
+            self.assertEqual(info.status, "configured")
+            self.assertEqual(info.backend, "transformers")
+
+    def test_backend_used_tracked_in_verify(self):
+        """verify() result should include backend_used field."""
+        verifier = QwenVerifier(api_key=None, ollama_base_url=UNREACHABLE_OLLAMA_URL)
+        verifier._status = "configured"
+        verifier.ollama_model = "qwen2.5vl:7b"
+        with patch.object(verifier, "_build_crops", return_value=("fakebase64tight", "fakebase64context")), \
+             patch.object(verifier, "_verify_via_ollama", return_value={"class": "electric_utility_pole", "decision": "accept"}):
+            res = verifier.verify("dummy.jpg", DetectionBox(
+                xyxy=(10.0, 20.0, 50.0, 200.0),
+                corners=xyxy_to_obb_corners(10, 20, 50, 200).tolist(),
+                confidence=0.85, model_source="DINO+SAM",
+            ))
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["backend_used"], "ollama")
+
+
 if __name__ == "__main__":
     unittest.main()
+

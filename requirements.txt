@@ -2,7 +2,7 @@
 # Core dependencies
 #
 # Versions below are pinned to what is actually installed and verified
-# working in the current dev environment (checked 2026-09-09), not loose
+# working in the current dev environment (checked 2026-09-11), not loose
 # aspirational lower bounds. Bump deliberately and re-run the test suite --
 # see REQUIREMENTS.md section 5/6 for the transformers 5.x / SAM3 gap this
 # pin currently blocks.
@@ -11,23 +11,29 @@
 torch==2.8.0
 torchvision==0.23.0
 transformers==4.57.0
+accelerate==1.10.1  # Required for device_map="auto" in Qwen3VLTransformersBackend
+safetensors==0.6.2  # Hugging Face model weight serialization
+huggingface-hub==0.35.3  # HF Hub checkpoint resolution and cache lookups
 
 # YOLOv8 (Ultralytics) -- benchmark-only detector (best.pt/A_S.pt), never
 # used by the production AI_LABEL/DINO_SAM pipeline. See REQUIREMENTS.md 3.3.
 ultralytics==8.4.45
 
-# Backend web server (backend/app.py)
+# Backend web server (backend/app.py) & microservices (services/sam3_service.py)
 fastapi==0.136.1
 uvicorn[standard]==0.46.0
 python-multipart==0.0.32
+pydantic==2.13.3  # API request/response schemas and settings validation
 requests==2.32.5  # models/adapters/sam3_http_adapter.py (isolated SAM3 service client)
+httpx==0.28.1  # FastAPI TestClient and async HTTP client
 
 # Computer Vision & Image Processing
-opencv-python==4.13.0
+opencv-python==4.13.0.92
 Pillow==12.3.0
 numpy==2.3.3
 scipy==1.16.2
-shapely==2.1.2  # OBB polygon validation/IoU (src/geometry_obb.py, models/adapters/obb_generator.py) -- was missing from this file despite being a real, used dependency
+shapely==2.1.2  # OBB polygon validation/IoU (src/geometry_obb.py, models/adapters/obb_generator.py)
+albumentations==2.0.8  # Image augmentation pipeline (src/data_preprocessing.py)
 
 # Data handling
 pandas==2.3.3
@@ -38,14 +44,14 @@ tqdm==4.67.1
 matplotlib==3.10.6
 seaborn==0.13.2
 
-# VLM verifier APIs (optional -- only needed for the DashScope cloud fallback
-# path in models/adapters/qwen_adapter.py; not installed here since this
-# environment uses a local Ollama Qwen model instead. Install only if you
-# set QWEN_API_KEY/DASHSCOPE_API_KEY.)
-dashscope>=1.14.0
+# VLM verifier APIs & clients (models/adapters/qwen_adapter.py)
+dashscope>=1.14.0  # Optional: DashScope cloud API fallback (requires QWEN_API_KEY)
+ollama==0.6.2  # Optional: Local Ollama Python client
 
-# Evaluation metrics
+# Evaluation metrics & testing
 scikit-learn==1.6.1
+pytest==9.0.3
+pytest-asyncio==1.4.0
 
 # --- Removed (verified unused anywhere in this codebase as of 2026-09-09):
 # tensorflow, pycocotools, gsvmaps, label-studio-converter -- leftovers from

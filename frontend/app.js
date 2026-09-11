@@ -1769,7 +1769,7 @@ async function triggerInference(mode) {
     : 'Running All Models (YOLO + Grounding DINO + SAM)... (~15s on CPU)';
   showSpinner(msg);
   try {
-    const res = await fetch(API_BASE + 'api/inference/detect', {
+    const data = await fetchJson(API_BASE + 'api/inference/detect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1780,7 +1780,6 @@ async function triggerInference(mode) {
         use_sam_refinement: true
       })
     });
-    const data = await res.json();
     if (token !== activeLoadToken) return; // active image changed while this request was in flight
     state.boxes = (data.boxes || []).map(b => ({
       ...b,
@@ -1813,7 +1812,7 @@ async function refineSelectedWithSAM() {
       xyxy = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
     }
 
-    const res = await fetch(API_BASE + 'api/inference/segment_box', {
+    const data = await fetchJson(API_BASE + 'api/inference/segment_box', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1822,7 +1821,6 @@ async function refineSelectedWithSAM() {
         box_xyxy: xyxy
       })
     });
-    const data = await res.json();
     // Bail if the active image changed, or this box is no longer the one
     // in state.boxes (e.g. a fresh AI inference run replaced the array
     // while this refine request was in flight) -- otherwise we'd either
