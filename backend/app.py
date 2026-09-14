@@ -21,6 +21,15 @@ import threading
 import logging
 from pathlib import Path
 
+# Without this, INFO-level logs from this module and the model adapters
+# (Qwen3-VL load/inference timing, device, CUDA memory -- see
+# models/adapters/qwen3vl_transformers_backend.py) are silently dropped:
+# the root logger has no handler by default, so a long-running batch job
+# that's actually loading/running a model looks frozen in the terminal.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger("backend.app")
 from typing import List, Dict, Any, Optional, Union, Tuple
 from contextlib import asynccontextmanager

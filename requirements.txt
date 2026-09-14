@@ -11,7 +11,10 @@
 torch==2.8.0
 torchvision==0.23.0
 transformers==4.57.0
-accelerate==1.10.1  # Required for device_map="auto" in Qwen3VLTransformersBackend
+accelerate==1.10.1  # Required for device_map="auto" in Qwen3VLTransformersBackend.
+# Confirmed working at accelerate==1.15.0 on the deepthink H200 GPU deploy target;
+# device_map="auto" degrades SILENTLY to CPU (no error) on a GPU with no free
+# memory, regardless of accelerate version -- see deploy/deepthink.env's notes.
 safetensors==0.6.2  # Hugging Face model weight serialization
 huggingface-hub==0.35.3  # HF Hub checkpoint resolution and cache lookups
 

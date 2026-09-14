@@ -304,6 +304,20 @@ invariant, positive signed shoelace area).
   per crop) — a GPU (e.g. H200/A100 target) or a smaller local model is required
   for interactive use; `QWEN_OLLAMA_TIMEOUT_S` (default 300s) is tunable per
   environment.
+- **Shared/partitioned GPU memory gotcha (confirmed live on deepthink,
+  2026-09-14)**: `device_map="auto"` degrades a Transformers-backend Qwen
+  load to CPU *silently* (no hard error, only a cryptic `accelerate` warning
+  like "...does not fit any GPU's remaining memory") whenever the visible
+  GPU has no free memory — which happens even on a real H200 if the
+  environment only exposes a partitioned/quota'd slice of it (confirmed
+  ~24.58GB via `torch.cuda.mem_get_info()`, not the physical card's 141GB)
+  and something else (most often a leftover orphaned process from a prior
+  run) is holding that whole slice. This produces a batch job that looks
+  frozen/crawling with no visible error, indistinguishable at the UI level
+  from a genuine hang. Always check `ps aux | grep -i python` for stragglers
+  and confirm `torch.cuda.mem_get_info()` shows real free memory before
+  starting a batch run in a memory-constrained shared-GPU environment — see
+  `deploy/deepthink.env` for the full incident notes and diagnostic commands.
 - No hardware GPU is required for the app to run — every stage degrades to
   CPU or reports `unavailable`/`error` rather than requiring CUDA.
 
