@@ -74,6 +74,11 @@ DECISION_COLOR = {
 # that's available).
 CATEGORY_COLOR = {"HIGH_QUALITY": (0, 200, 0), "REVIEW": (0, 200, 255), "REJECT": (0, 0, 255)}
 YOLO_COMPARE_COLOR = (255, 128, 0)  # orange, benchmark-only overlay
+# Matches frontend/app.js::drawOBB's recovery colors (BGR here, RGB there)
+# so a reviewer sees the same visual language in both the live UI and these
+# offline overlays.
+RECOVERY_COLOR = {"RECOVERED_CANDIDATE": (207, 197, 57), "REVIEW_REQUIRED": (186, 120, 247)}
+DINO_RAW_COLOR = (128, 128, 128)  # gray, --full-debug only
 
 CONFIG_PRESETS = {
     "A": {"enable_geometry_qa": False, "qwen_gating": "off"},
@@ -121,17 +126,20 @@ def _load_ground_truth(gt_dir: str, name: str, img_w: int, img_h: int):
 def _run_one_config(
     img_path: Path, name: str, dataset_id: str,
     enable_geometry_qa: bool, qwen_gating: str,
+    enable_obb_recovery: bool | None = None,
 ):
     boxes, raw = run_ai_pipeline(
         img_path=img_path, mode="AI_LABEL", use_sam_refinement=True,
         dataset_id=dataset_id, filename=name,
         enable_geometry_qa=enable_geometry_qa, qwen_gating=qwen_gating,
+        enable_obb_recovery=enable_obb_recovery,
     )
     decision_counts: dict = defaultdict(int)
     for b in boxes:
         decision = b.attributes.get("decision") or b.attributes.get("category", "REVIEW")
         decision_counts[decision] += 1
     verification = raw.get("verification", {})
+    recovery = raw.get("obb_recovery", {})
     return {
         "boxes": boxes,
         "raw": raw,
@@ -147,6 +155,10 @@ def _run_one_config(
         "qwen_available": verification.get("qwen_available"),
         "final_count": len(boxes),
         "error": raw.get("error"),
+        "recovery_ran": recovery.get("recovery_ran", False),
+        "n_recovery_candidates": recovery.get("n_recovery_candidates", 0),
+        "n_recovery_kept": recovery.get("n_recovery_kept", 0),
+        "n_recovery_duplicates": recovery.get("n_recovery_duplicates", 0),
     }
 
 
@@ -159,6 +171,8 @@ def run_benchmark(
     enable_geometry_qa: bool = True,
     qwen_gating: str = "gated",
     ground_truth_dir: str | None = None,
+    enable_obb_recovery: bool | None = None,
+    full_debug: bool = False,
 ) -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -175,7 +189,10 @@ def run_benchmark(
         name = Path(img_path).name
         cat_label = categories.get(name, "uncategorized")
 
-        result = _run_one_config(Path(img_path), name, dataset_id, enable_geometry_qa, qwen_gating)
+        result = _run_one_config(
+            Path(img_path), name, dataset_id, enable_geometry_qa, qwen_gating,
+            enable_obb_recovery=enable_obb_recovery,
+        )
         boxes, raw = result["boxes"], result["raw"]
 
         img = cv2.imread(str(img_path))
@@ -184,7 +201,26 @@ def run_benchmark(
             continue
         img_h, img_w = img.shape[:2]
 
+        if full_debug:
+            # Debug visualization mode (spec): show raw DINO detections
+            # underneath the final overlay, so it's visible by eye whether a
+            # kept box came from a real DINO candidate or was only found by
+            # recovery -- draw these first so final boxes render on top.
+            for d in raw.get("dino", []):
+                x0, y0, x1, y1 = [int(v) for v in d["xyxy"]]
+                cv2.rectangle(img, (x0, y0), (x1, y1), DINO_RAW_COLOR, 1)
+                cv2.putText(img, f"DINO raw {d['confidence']:.2f}", (x0, max(12, y0 - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, DINO_RAW_COLOR, 1, cv2.LINE_AA)
+
         for b in boxes:
+            if b.model_source == "OBB_RECOVERY":
+                status = b.attributes.get("recovery_status", "RECOVERED_CANDIDATE")
+                report["totals"][f"recovery_{status}"] += 1
+                report["by_category_label"][cat_label][f"recovery_{status}"] += 1
+                color = RECOVERY_COLOR.get(status, (255, 255, 255))
+                pole_score = b.attributes.get("recovery_score", {}).get("pole_score", 0.0)
+                draw_obb(img, b.corners, color, f"RECOVERY:{status} score={pole_score:.2f}")
+                continue
             decision = b.attributes.get("decision") or b.attributes.get("category", "REVIEW")
             report["totals"][decision] += 1
             report["by_category_label"][cat_label][decision] += 1
@@ -235,6 +271,10 @@ def run_benchmark(
             "by_decision": result["decision_counts"],
             "ground_truth_precision": gt_precision,
             "ground_truth_recall": gt_recall,
+            "recovery_ran": result["recovery_ran"],
+            "n_recovery_candidates": result["n_recovery_candidates"],
+            "n_recovery_kept": result["n_recovery_kept"],
+            "n_recovery_duplicates": result["n_recovery_duplicates"],
             "error": raw.get("error"),
         }
         if yolo_summary is not None:
@@ -353,6 +393,159 @@ def run_compare_configs(
     return comparison
 
 
+def run_recovery_comparison(
+    image_paths: list[str], out_dir: str, dataset_id: str,
+    categories: dict[str, str] | None = None, ground_truth_dir: str | None = None,
+) -> dict:
+    """
+    Spec's dedicated OBB-recovery evaluation mode: A (DINO+SAM only,
+    recovery off) vs B (DINO+SAM+OBB Recovery, recovery on) -- a DIFFERENT
+    comparison axis than run_compare_configs' geometry_qa/qwen A/B/C/D
+    presets above. Both A and B here hold geometry_qa=on, qwen=gated (the
+    live app's production defaults) so the ONLY thing that differs is
+    whether models/adapters/obb_recovery.py ran.
+
+    Reports (spec section 'Evaluation'): pole recall, precision,
+    false-positive rate, number of recovered true poles, number of
+    recovered false positives, duplicate rate, OBB IoU against ground-truth
+    labels, percentage of candidates requiring human review.
+
+    Recall/precision/recovered-true/recovered-false and OBB-IoU are ONLY
+    computed when --ground-truth-dir is supplied -- without it, only
+    candidate/duplicate/review counts are reported, since (spec) 'the
+    primary objective is to increase pole recall without causing a large
+    increase in false positives' and neither can be measured without real
+    ground truth to check against.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    categories = categories or {}
+
+    presets = {"A_no_recovery": False, "B_with_recovery": True}
+    labels = {"A_no_recovery": "DINO+SAM only", "B_with_recovery": "DINO+SAM+OBB Recovery"}
+
+    comparison: dict = {"configs": labels, "per_config": {}, "per_image": {}}
+
+    for cfg_key, recovery_on in presets.items():
+        print(f"\n--- Recovery Config {cfg_key}: {labels[cfg_key]} ---")
+        agg: dict = defaultdict(int)
+        pr_list = []
+        iou_list = []
+        n_review_required = 0
+        n_total_boxes = 0
+        last_result = None
+
+        for img_path in image_paths:
+            name = Path(img_path).name
+            result = _run_one_config(
+                Path(img_path), name, f"{dataset_id}_{cfg_key}",
+                enable_geometry_qa=True, qwen_gating="gated", enable_obb_recovery=recovery_on,
+            )
+            last_result = result
+            boxes = result["boxes"]
+            n_total_boxes += len(boxes)
+            n_review_required += sum(1 for b in boxes if b.needs_review)
+            agg["n_recovery_candidates"] += result["n_recovery_candidates"]
+            agg["n_recovery_kept"] += result["n_recovery_kept"]
+            agg["n_recovery_duplicates"] += result["n_recovery_duplicates"]
+            agg["n_errors"] += 1 if result["error"] else 0
+
+            recovered_true = recovered_false = None
+            if ground_truth_dir:
+                img = cv2.imread(str(img_path))
+                if img is not None:
+                    h, w = img.shape[:2]
+                    gts = _load_ground_truth(ground_truth_dir, name, w, h)
+                    if gts is not None:
+                        preds = [{"bbox": b.xyxy, "confidence": b.confidence} for b in boxes]
+                        if gts:
+                            p, r = DetectionEvaluator.compute_precision_recall(preds, gts)
+                        else:
+                            p, r = (1.0, 1.0) if not preds else (0.0, 1.0)
+                        pr_list.append((p, r))
+
+                        # Classify each RECOVERY-origin box as a true/false
+                        # positive by greedy IoU>=0.5 matching against
+                        # not-yet-matched ground-truth boxes.
+                        recovery_boxes = [b for b in boxes if b.model_source == "OBB_RECOVERY"]
+                        if recovery_boxes:
+                            recovered_true, recovered_false = 0, 0
+                            used_gt = [False] * len(gts)
+                            for b in recovery_boxes:
+                                best_iou, best_idx = 0.0, -1
+                                for gi, g in enumerate(gts):
+                                    if used_gt[gi]:
+                                        continue
+                                    iou = DetectionEvaluator.compute_iou(b.xyxy, g["bbox"])
+                                    if iou > best_iou:
+                                        best_iou, best_idx = iou, gi
+                                if best_iou >= 0.5:
+                                    recovered_true += 1
+                                    used_gt[best_idx] = True
+                                    iou_list.append(best_iou)
+                                else:
+                                    recovered_false += 1
+                            agg["n_recovered_true"] += recovered_true
+                            agg["n_recovered_false"] += recovered_false
+
+            comparison["per_image"].setdefault(name, {})[cfg_key] = {
+                "final_count": len(boxes),
+                "n_recovery_kept": result["n_recovery_kept"],
+                "n_recovery_duplicates": result["n_recovery_duplicates"],
+                "recovered_true": recovered_true, "recovered_false": recovered_false,
+            }
+
+        n_kept = agg["n_recovery_kept"]
+        n_dup = agg["n_recovery_duplicates"]
+        duplicate_rate = (n_dup / (n_dup + n_kept)) if (n_dup + n_kept) > 0 else None
+        review_pct = (n_review_required / n_total_boxes) if n_total_boxes else None
+
+        comparison["per_config"][cfg_key] = {
+            "label": labels[cfg_key],
+            "totals": dict(agg),
+            "duplicate_rate": round(duplicate_rate, 4) if duplicate_rate is not None else None,
+            "pct_candidates_needing_review": round(review_pct, 4) if review_pct is not None else None,
+            "qwen_available": last_result["qwen_available"] if last_result else None,
+        }
+        if pr_list:
+            mean_p = float(np.mean([p for p, _ in pr_list]))
+            comparison["per_config"][cfg_key]["ground_truth"] = {
+                "macro_precision": round(mean_p, 4),
+                "macro_recall": round(float(np.mean([r for _, r in pr_list])), 4),
+                "false_positive_rate": round(1.0 - mean_p, 4),
+                "n_images": len(pr_list),
+            }
+        if iou_list:
+            comparison["per_config"][cfg_key]["recovered_obb_iou_vs_ground_truth"] = {
+                "mean": round(float(np.mean(iou_list)), 4), "n_matched": len(iou_list),
+            }
+        print(json.dumps(comparison["per_config"][cfg_key], indent=2))
+
+    (out / "recovery_compare_report.json").write_text(json.dumps(comparison, indent=2))
+
+    print(f"\n{'=' * 60}\nRecovery comparison written to {out}/recovery_compare_report.json")
+    a_gt = comparison["per_config"]["A_no_recovery"].get("ground_truth")
+    b_gt = comparison["per_config"]["B_with_recovery"].get("ground_truth")
+    if a_gt and b_gt:
+        delta = round(b_gt["macro_recall"] - a_gt["macro_recall"], 4)
+        verdict = "IMPROVED" if delta > 0 else ("NO CHANGE" if delta == 0 else "REGRESSED")
+        print(f"Recall with recovery: {a_gt['macro_recall']} -> {b_gt['macro_recall']} (delta={delta:+.4f}, {verdict})")
+        print(
+            f"False-positive rate: {a_gt['false_positive_rate']} -> {b_gt['false_positive_rate']}\n"
+            "Objective (spec): increase pole recall without causing a large increase in false "
+            "positives -- judge BOTH numbers together, not recall alone."
+        )
+    else:
+        print(
+            "No --ground-truth-dir was supplied: candidate/duplicate/review counts only.\n"
+            "Per the spec: 'Do not claim that the recovery stage improves performance until\n"
+            "the evaluation demonstrates it.' Recall/precision/recovered-true-vs-false cannot\n"
+            "be computed without real ground truth to check against."
+        )
+    print(f"{'=' * 60}")
+    return comparison
+
+
 def main():
     ap = argparse.ArgumentParser(description="Benchmark the DINO+SAM3->GeometryQA->Qwen->Decision production pipeline on a small image set")
     ap.add_argument("--images", help="Directory to sample images from")
@@ -365,9 +558,21 @@ def main():
                      help="Also run YOLO_FAST (models/best.pt) on the same images as a benchmark-only overlay")
     ap.add_argument("--compare-configs", action="store_true",
                      help="Run all 4 verification-pipeline configs (A/B/C/D, spec section 13) and report side by side")
+    ap.add_argument("--compare-recovery", action="store_true",
+                     help="Run the OBB-recovery A/B evaluation: DINO+SAM only vs DINO+SAM+OBB Recovery, holding "
+                          "geometry_qa/qwen at production defaults -- reports recall/precision/false-positive-rate/"
+                          "recovered-true-vs-false/duplicate-rate/review-pct (best with --ground-truth-dir)")
     ap.add_argument("--enable-geometry-qa", dest="enable_geometry_qa", action="store_true", default=True)
     ap.add_argument("--disable-geometry-qa", dest="enable_geometry_qa", action="store_false")
     ap.add_argument("--qwen-gating", choices=["off", "gated", "always"], default="gated")
+    ap.add_argument("--enable-obb-recovery", dest="enable_obb_recovery", action="store_true", default=None,
+                     help="Force OBB recovery on for this single-config run, overriding configs/config.yaml")
+    ap.add_argument("--disable-obb-recovery", dest="enable_obb_recovery", action="store_false",
+                     help="Force OBB recovery off for this single-config run, overriding configs/config.yaml")
+    ap.add_argument("--full-debug", action="store_true",
+                     help="Debug visualization mode: also draw raw (pre-dedup) DINO boxes on the overlay, "
+                          "alongside SAM-refined/recovered/final boxes, so it's visible by eye whether the "
+                          "recovery stage is finding genuinely-missed poles or just creating false positives")
     ap.add_argument("--ground-truth-dir", help="Directory of human-verified YOLO-OBB .txt files (same stem as each image) for real precision/recall")
     args = ap.parse_args()
 
@@ -393,11 +598,14 @@ def main():
 
     if args.compare_configs:
         run_compare_configs(image_paths, args.out, args.dataset_id, categories=categories, ground_truth_dir=args.ground_truth_dir)
+    elif args.compare_recovery:
+        run_recovery_comparison(image_paths, args.out, args.dataset_id, categories=categories, ground_truth_dir=args.ground_truth_dir)
     else:
         run_benchmark(
             image_paths, args.out, args.dataset_id, compare_yolo=args.compare_yolo, categories=categories,
             enable_geometry_qa=args.enable_geometry_qa, qwen_gating=args.qwen_gating,
             ground_truth_dir=args.ground_truth_dir,
+            enable_obb_recovery=args.enable_obb_recovery, full_debug=args.full_debug,
         )
 
 

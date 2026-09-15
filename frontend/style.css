@@ -492,6 +492,7 @@ body {
 .layer-chk.yolo { color: #58a6ff; }
 .layer-chk.dino { color: #f0883e; }
 .layer-chk.sam { color: #bc8cff; }
+.layer-chk.recovery { color: #39c5cf; }
 
 /* Canvas Viewport */
 .canvas-viewport {

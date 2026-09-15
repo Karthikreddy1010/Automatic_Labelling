@@ -19,6 +19,7 @@ import time
 import asyncio
 import threading
 import logging
+import dataclasses
 from pathlib import Path
 
 # Without this, INFO-level logs from this module and the model adapters
@@ -65,11 +66,19 @@ from models.adapters.decision_engine import (
     config_from_dict as decision_config_from_dict,
 )
 from models.adapters.obb_generator import generate_and_validate_obb
+from models.adapters.obb_recovery import (
+    RecoveryConfig,
+    config_from_dict as recovery_config_from_dict,
+    should_run_recovery,
+    generate_recovery_candidates,
+)
+from models.adapters.recovery_dedup import dedup_recovery_against_existing
 from src.geometry_obb import (
     xyxy_to_obb_corners,
     mask_to_obb_corners,
     order_corners_canonical,
     obb_corners_to_xyxy,
+    obb_iou,
 )
 
 # Global Manager Instances
@@ -98,6 +107,7 @@ def _load_verification_pipeline_config() -> Dict[str, Any]:
 _verification_cfg = _load_verification_pipeline_config()
 GEOMETRY_QA_CONFIG = geometry_config_from_dict(_verification_cfg.get("geometry_qa"))
 DECISION_CONFIG = decision_config_from_dict(_verification_cfg.get("decision"))
+RECOVERY_CONFIG = recovery_config_from_dict(_verification_cfg.get("obb_recovery"))
 QWEN_GATING_DEFAULT = (_verification_cfg.get("qwen") or {}).get("gating", "gated")
 # Production default: DINO alone proposes candidates; SAM3 only refines via
 # box-prompt segmentation. True only enables the experimental dual-proposer
@@ -460,9 +470,58 @@ def get_image_annotations(dataset_id: str, filename: str):
     return {"type": "none", "data": None}
 
 
+_RECOVERY_REJECTION_MATCH_IOU = 0.5  # a saved box within this rotated IoU of a prior recovery candidate counts as "kept", not rejected
+
+
+def _record_rejected_recovery_candidates(dataset_id: str, filename: str, new_boxes: List[DetectionBox]) -> None:
+    """
+    Spec: 'Every rejected recovered OBB should be stored as useful
+    hard-negative information.' A recovery candidate has no dedicated
+    reject button -- it's rejected by the human simply removing it (Delete/
+    Reject) from the canvas before saving, same as any other box. So the
+    rejection is detected here by diffing: any OBB_RECOVERY-origin box that
+    was in this image's last-saved raw predictions but has no
+    rotated-IoU-matching counterpart in the newly-saved `new_boxes` was
+    implicitly rejected.
+    """
+    prev = storage_mgr.get_predictions(dataset_id, filename)
+    if not prev:
+        return
+    prev_boxes = [DetectionBox.from_dict(b) for b in prev.get("boxes", [])]
+    recovery_prev = [b for b in prev_boxes if b.model_source == "OBB_RECOVERY"]
+    if not recovery_prev:
+        return
+
+    new_corners = [np.asarray(b.corners) if b.corners else xyxy_to_obb_corners(*b.xyxy) for b in new_boxes]
+
+    for cand in recovery_prev:
+        cand_corners = np.asarray(cand.corners) if cand.corners else xyxy_to_obb_corners(*cand.xyxy)
+        still_kept = any(obb_iou(cand_corners, nc) >= _RECOVERY_REJECTION_MATCH_IOU for nc in new_corners)
+        if still_kept:
+            continue
+        score = cand.attributes.get("recovery_score") or {}
+        components = score.get("components", {})
+        try:
+            storage_mgr.record_recovery_rejection(dataset_id, {
+                "image_id": filename,
+                "proposed_obb": cand.corners,
+                "recovery_score": score,
+                "recovery_status": cand.attributes.get("recovery_status"),
+                "rejection_reason": "removed_by_human_reviewer_before_save",
+                "dino_detected_nearby": components.get("dino_agreement") is not None,
+                "sam_evidence_present": components.get("segmentation_agreement") is not None,
+                "final_human_decision": "rejected",
+            })
+        except Exception as e:
+            # Active-learning bookkeeping must never block the human's actual
+            # save -- but the failure itself is still worth surfacing.
+            logger.warning("Failed to record recovery-rejection feedback for %s/%s: %s", dataset_id, filename, e)
+
+
 @app.post("/api/datasets/{dataset_id}/images/{filename}/annotations")
 def save_image_annotations(dataset_id: str, filename: str, req: SaveAnnotationRequest):
     boxes = [DetectionBox.from_dict(b) for b in req.boxes]
+    _record_rejected_recovery_candidates(dataset_id, filename, boxes)
     saved = storage_mgr.save_annotation(
         dataset_id,
         filename,
@@ -488,6 +547,7 @@ def reject_image_annotation(
     ft = req.failure_type if req and req.failure_type else "false_positive"
     nc = req.negative_category if req else None
     al_cats = req.al_categories if req else None
+    _record_rejected_recovery_candidates(dataset_id, filename, new_boxes=[])  # whole image rejected -- nothing kept
     saved = storage_mgr.reject_with_metadata(
         dataset_id,
         filename,
@@ -533,6 +593,15 @@ def export_dataset_endpoint(dataset_id: str):
 def get_active_learning_queue_endpoint(dataset_id: str, filter_reason: Optional[str] = Query(None)):
     queue = storage_mgr.get_active_learning_queue(dataset_id, filter_reason=filter_reason)
     return {"queue": queue, "count": len(queue)}
+
+
+@app.get("/api/datasets/{dataset_id}/active_learning/recovery_feedback")
+def get_recovery_feedback_endpoint(dataset_id: str):
+    """Structured hard-negative dataset of rejected OBB-recovery candidates
+    (spec: 'Active learning' section) -- for review ahead of a periodic
+    retraining pass. Never auto-trains anything; read-only."""
+    records = storage_mgr.get_recovery_feedback(dataset_id)
+    return {"records": records, "count": len(records)}
 
 
 @app.get("/api/datasets/{dataset_id}/next_difficult")
@@ -621,6 +690,21 @@ def get_verification_pipeline_config():
             "accept_threshold": DECISION_CONFIG.accept_threshold,
             "review_threshold": DECISION_CONFIG.review_threshold,
             "semantic_reject_confidence": DECISION_CONFIG.semantic_reject_confidence,
+        },
+        "obb_recovery": {
+            "enabled": RECOVERY_CONFIG.enabled,
+            "recovery_activation_threshold": RECOVERY_CONFIG.recovery_activation_threshold,
+            "min_pole_score": RECOVERY_CONFIG.min_pole_score,
+            "review_threshold": RECOVERY_CONFIG.review_threshold,
+            "max_candidates_per_image": RECOVERY_CONFIG.max_candidates_per_image,
+            "min_aspect_ratio": RECOVERY_CONFIG.min_aspect_ratio,
+            "max_aspect_ratio": RECOVERY_CONFIG.max_aspect_ratio,
+            "max_angle_from_vertical_deg": RECOVERY_CONFIG.max_angle_from_vertical_deg,
+            "min_width_px": RECOVERY_CONFIG.min_width_px,
+            "max_width_px": RECOVERY_CONFIG.max_width_px,
+            "duplicate_iou_threshold": RECOVERY_CONFIG.duplicate_iou_threshold,
+            "max_extension_factor": RECOVERY_CONFIG.max_extension_factor,
+            "weights": RECOVERY_CONFIG.weights.as_dict(),
         },
     }
 
@@ -856,6 +940,77 @@ def _apply_verification(
     return kept, counts
 
 
+_recovery_logger = logging.getLogger("obb_recovery")
+
+
+def _apply_obb_recovery(
+    result_boxes: List[DetectionBox],
+    img_path: Path,
+    dino_boxes: List[DetectionBox],
+    filename: Optional[str] = None,
+    enable_override: Optional[bool] = None,
+) -> Tuple[List[DetectionBox], Dict[str, Any]]:
+    """
+    Stage 5 of the production pipeline: a geometry-driven fallback applied
+    AFTER DINO+SAM3+geometry+Qwen (_apply_verification, above) have already
+    produced their final result_boxes. See models/adapters/obb_recovery.py's
+    module docstring for the full activation/scoring/dedup contract; in
+    short:
+      - Only activates when the primary result is empty or weak
+        (should_run_recovery) -- never second-guesses a confident DINO/SAM3
+        result.
+      - Never auto-ACCEPTs on its own: every recovered candidate is kept
+        with needs_review=True (obb_recovery.py sets this unconditionally).
+      - Never duplicates an existing candidate: rotated-IoU dedup via
+        recovery_dedup.py, not axis-aligned.
+    Logs one structured line per kept candidate: image -> candidate OBB ->
+    geometry/DINO/SAM/final pole_score -> status, per the spec's logging
+    requirement.
+    """
+    counts = {
+        "recovery_ran": False, "n_recovery_candidates": 0,
+        "n_recovery_kept": 0, "n_recovery_duplicates": 0,
+    }
+    # enable_override lets callers (e.g. the A/B evaluation harness --
+    # legacy/pipeline/benchmark_dino_sam.py) force recovery on/off per run
+    # without touching configs/config.yaml, mirroring the existing
+    # enable_geometry_qa/qwen_gating per-call override pattern above.
+    config = RECOVERY_CONFIG if enable_override is None else dataclasses.replace(RECOVERY_CONFIG, enabled=enable_override)
+    if not should_run_recovery(result_boxes, config):
+        return result_boxes, counts
+
+    counts["recovery_ran"] = True
+    raw_candidates = generate_recovery_candidates(
+        str(img_path), result_boxes, config=config, dino_boxes=dino_boxes,
+    )
+    counts["n_recovery_candidates"] = len(raw_candidates)
+
+    kept, discarded = dedup_recovery_against_existing(
+        raw_candidates, result_boxes, iou_threshold=config.duplicate_iou_threshold,
+    )
+    counts["n_recovery_duplicates"] = len(discarded)
+    counts["n_recovery_kept"] = len(kept)
+
+    for c in kept:
+        score = c.attributes["recovery_score"]
+        _recovery_logger.info(
+            "%s -> candidate=%s geometry_score=%.3f dino_score=%s sam_score=%s "
+            "pole_score=%.3f status=%s",
+            filename or img_path.name, c.attributes["recovery_geometry"],
+            score["components"].get("verticality", 0.0),
+            score["components"].get("dino_agreement"),
+            score["components"].get("segmentation_agreement"),
+            score["pole_score"], c.attributes["recovery_status"],
+        )
+    for d in discarded:
+        _recovery_logger.info(
+            "%s -> candidate discarded: duplicate_of_existing iou=%.3f matched_index=%d",
+            filename or img_path.name, d["iou"], d["matched_existing_index"],
+        )
+
+    return result_boxes + kept, counts
+
+
 def run_ai_pipeline(
     img_path: Path,
     mode: str = "AI_LABEL",
@@ -869,6 +1024,7 @@ def run_ai_pipeline(
     max_candidates: Optional[int] = None,
     enable_geometry_qa: bool = True,
     qwen_gating: Optional[str] = None,
+    enable_obb_recovery: Optional[bool] = None,
 ) -> Tuple[List[DetectionBox], Dict[str, Any]]:
     """
     Executes detection pipeline:
@@ -999,6 +1155,14 @@ def run_ai_pipeline(
             "qwen_gating": gating,
             **verify_counts,
         }
+
+        _t_recovery = time.perf_counter()
+        result_boxes, recovery_counts = _apply_obb_recovery(
+            result_boxes, img_path, dino_boxes, filename=filename,
+            enable_override=enable_obb_recovery,
+        )
+        timings["recovery_ms"] = round((time.perf_counter() - _t_recovery) * 1000, 1)
+        raw_outputs["obb_recovery"] = recovery_counts
 
         timings["total_ms"] = round((time.perf_counter() - _t0) * 1000, 1)
         if (_verification_cfg.get("logging", {}) or {}).get("log_stage_timings", True):

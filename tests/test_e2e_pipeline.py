@@ -2,7 +2,8 @@
 tests/test_e2e_pipeline.py - End-to-End Pipeline Test
 ============================================================
 
-Part 18 (end-to-end): image -> DINO -> SAM3 -> geometry -> Qwen -> OBB.
+Part 18 (end-to-end): image -> DINO -> SAM3 -> geometry -> Qwen -> OBB ->
+OBB Recovery (models/adapters/obb_recovery.py) fallback.
 
 This machine actually has Grounding DINO loadable (weights cached locally
 from earlier work this session), but no local Qwen3-VL-8B checkpoint and no
@@ -57,16 +58,28 @@ class TestEndToEndPipeline(unittest.TestCase):
             self.assertIn("unavailable", raw_outputs["error"].lower())
             return
 
-        # If DINO+SAM did load (e.g. this test runs on HAWK), every kept
-        # candidate must carry a real OBB and a decision from the combined
-        # verification pipeline -- proving the full chain actually ran.
+        # Every kept candidate must carry a real OBB, and evidence it went
+        # through ONE of the two independent code paths that can produce a
+        # box here: the DINO/SAM3 + decision_engine.py path (attributes.
+        # decision, ACCEPT/REVIEW -- REJECT already dropped) or the OBB
+        # Recovery fallback path (attributes.recovery_status), which only
+        # activates when DINO/SAM3 found nothing/weak evidence -- exactly
+        # what a synthetic bright bar with no real pole texture triggers.
+        # Recovery candidates never carry "decision" (they don't go through
+        # decision_engine.py at all -- see obb_recovery.py's module
+        # docstring for why review-gating is separate there).
         for box in boxes:
             self.assertIsNotNone(box.corners)
             self.assertEqual(len(box.corners), 4)
-            self.assertIn("decision", box.attributes)
-            self.assertIn(box.attributes["decision"], ("ACCEPT", "REVIEW"))  # REJECT already dropped
+            if "decision" in box.attributes:
+                self.assertIn(box.attributes["decision"], ("ACCEPT", "REVIEW"))  # REJECT already dropped
+            else:
+                self.assertIn("recovery_status", box.attributes)
+                self.assertTrue(box.needs_review)  # recovery never silently auto-accepts
         if "timings" in raw_outputs:
             self.assertIn("total_ms", raw_outputs["timings"])
+            self.assertIn("recovery_ms", raw_outputs["timings"])
+        self.assertIn("obb_recovery", raw_outputs)
 
 
 if __name__ == "__main__":

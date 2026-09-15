@@ -525,6 +525,48 @@ class DatasetManager:
             return None
         return json.loads(pred_path.read_text(encoding="utf-8"))
 
+    # --- OBB RECOVERY ACTIVE-LEARNING FEEDBACK ---
+    # Structured hard-negative dataset of rejected models.adapters.obb_recovery
+    # candidates (spec: "store as useful hard-negative information... for
+    # later use to improve the pole detector/classifier"). Append-only JSONL,
+    # one record per rejected candidate, NEVER auto-trains anything -- just a
+    # reviewable file for periodic manual retraining work. See
+    # backend/app.py::_record_rejected_recovery_candidates for the call site
+    # (diffed against a human's saved annotations, since recovery candidates
+    # are rejected implicitly by being removed from the canvas, not via a
+    # dedicated reject button).
+
+    def _recovery_feedback_path(self, dataset_id: str) -> Path:
+        d = self.base_dir / dataset_id / "active_learning"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "recovery_feedback.jsonl"
+
+    def record_recovery_rejection(self, dataset_id: str, record: Dict[str, Any]) -> None:
+        """Append one structured record for a rejected OBB-recovery candidate.
+        `record` should carry image_id, proposed_obb, recovery_score (with its
+        individual components), rejection_reason, dino_detected_nearby,
+        sam_evidence_present, and final_human_decision -- see the spec's
+        "Active learning" section for the full field list."""
+        entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "dataset_id": dataset_id, **record}
+        path = self._recovery_feedback_path(dataset_id)
+        with self._lock_for(dataset_id):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+
+    def get_recovery_feedback(self, dataset_id: str) -> List[Dict[str, Any]]:
+        """Read back all recorded recovery-rejection records for this dataset
+        (for review/export ahead of a periodic retraining pass)."""
+        path = self._recovery_feedback_path(dataset_id)
+        if not path.exists():
+            return []
+        records = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
     # --- MASK CACHING ---
 
     def save_mask(

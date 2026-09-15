@@ -55,7 +55,7 @@ const state = {
   dragTarget: null,
   
   filterStatus: 'all',
-  layerVisibility: { yolo: true, dino: true, sam: true },
+  layerVisibility: { yolo: true, dino: true, sam: true, recovery: true },
   labelFilter: 'all',   // 'all' | 'accept' | 'review' | 'reject' | 'disagreement' | 'geometry_warning' -- filters the per-image Labels list only
 
   batchPollInterval: null,
@@ -109,6 +109,7 @@ const elements = {
   toggleYolo: document.getElementById('toggle-yolo'),
   toggleDino: document.getElementById('toggle-dino'),
   toggleSam: document.getElementById('toggle-sam'),
+  toggleRecovery: document.getElementById('toggle-recovery'),
   
   btnPrevImg: document.getElementById('btn-prev-img'),
   btnNextImg: document.getElementById('btn-next-img'),
@@ -680,6 +681,7 @@ function render() {
     if (src.includes('yolo') && !state.layerVisibility.yolo && !src.includes('human')) return;
     if (src.includes('dino') && !state.layerVisibility.dino && !src.includes('human')) return;
     if (src.includes('sam') && !state.layerVisibility.sam && !src.includes('human')) return;
+    if (src.includes('recovery') && !state.layerVisibility.recovery) return;
     
     const isSelected = idx === state.selectedBoxIndex;
     const isHovered = idx === state.hoveredBoxIndex;
@@ -701,9 +703,21 @@ function drawOBB(box, isSelected, isHovered) {
   // Determine Color Scheme based on Review / Source / Confidence
   let strokeColor = '#58a6ff'; // Blue for human
   let fillColor = 'rgba(88, 166, 255, 0.2)';
+  let isDashedBorder = false;
   const decision = box.attributes && box.attributes.decision; // 'ACCEPT'|'REVIEW'|'REJECT' from decision_engine.py, when this box went through it
+  const isRecovery = box.model_source === 'OBB_RECOVERY';
 
-  if (box.model_source !== 'HUMAN') {
+  if (isRecovery) {
+    // Recovery-origin candidates never went through decision_engine.py and
+    // never auto-accept (see models/adapters/obb_recovery.py) -- give them
+    // a visual identity distinct from every DINO/SAM/human color above (not
+    // reusing green/yellow/red/blue) PLUS a dashed border, so they're
+    // recognizable even without relying on color alone.
+    isDashedBorder = true;
+    const reviewRequired = box.attributes && box.attributes.recovery_status === 'REVIEW_REQUIRED';
+    strokeColor = reviewRequired ? '#f778ba' : '#39c5cf'; // pink = needs review, cyan = recovered candidate
+    fillColor = reviewRequired ? 'rgba(247, 120, 186, 0.2)' : 'rgba(57, 197, 207, 0.2)';
+  } else if (box.model_source !== 'HUMAN') {
     if (decision === 'ACCEPT') {
       strokeColor = '#2ea043'; fillColor = 'rgba(46, 160, 67, 0.2)';
     } else if (decision === 'REJECT') {
@@ -738,7 +752,11 @@ function drawOBB(box, isSelected, isHovered) {
   ctx.fill();
   ctx.lineWidth = isSelected ? 2.5 / state.transform.scale : 1.5 / state.transform.scale;
   ctx.strokeStyle = strokeColor;
+  if (isDashedBorder && !isSelected) {
+    ctx.setLineDash([6 / state.transform.scale, 4 / state.transform.scale]);
+  }
   ctx.stroke();
+  ctx.setLineDash([]);
   
   // Draw Centerline / Orientation Vector (Pole Axis)
   const topCx = (corners[0][0] + corners[1][0]) / 2;
@@ -808,6 +826,9 @@ function drawOBB(box, isSelected, isHovered) {
   let labelStr;
   if (box.model_source === 'HUMAN') {
     labelStr = `${className} · Human`;
+  } else if (isRecovery) {
+    const status = (box.attributes && box.attributes.recovery_status) === 'REVIEW_REQUIRED' ? 'REVIEW_REQUIRED' : 'Recovered';
+    labelStr = `${className} · ${status} ${confText}`;
   } else if (decision) {
     labelStr = `${className} · ${decision} ${confText}`;
   } else {
@@ -921,6 +942,7 @@ function setupEventListeners() {
   elements.toggleYolo.addEventListener('change', (e) => { state.layerVisibility.yolo = e.target.checked; render(); });
   elements.toggleDino.addEventListener('change', (e) => { state.layerVisibility.dino = e.target.checked; render(); });
   elements.toggleSam.addEventListener('change', (e) => { state.layerVisibility.sam = e.target.checked; render(); });
+  elements.toggleRecovery.addEventListener('change', (e) => { state.layerVisibility.recovery = e.target.checked; render(); });
   
   // Top nav action buttons
   elements.btnAiLabel.addEventListener('click', () => triggerInference('AI_LABEL'));

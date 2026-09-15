@@ -210,3 +210,52 @@ verification_pipeline:
     # Qwen must be at least this confident (and not "uncertain") to drive a
     # REJECT on semantics alone; below this it lands in REVIEW instead.
     semantic_reject_confidence: 0.60
+
+  # --- OBB Pole Recovery (models/adapters/obb_recovery.py) -------------------
+  # A geometry-driven fallback that only activates when the primary DINO+SAM3
+  # pipeline (above) returns no candidates, or only weak/incomplete ones, for
+  # an image. It never replaces DINO/SAM3 -- see obb_recovery.py's module
+  # docstring for the full activation/scoring/dedup contract.
+  obb_recovery:
+    enabled: true
+    # Recovery only runs when the primary pipeline's best surviving
+    # candidate (if any) has confidence below this, or produced zero
+    # candidates outright.
+    recovery_activation_threshold: 0.55
+    # A recovered candidate below this combined pole_score is dropped
+    # entirely (never shown to the reviewer, never stored as a label).
+    min_pole_score: 0.25
+    # Between min_pole_score and review_threshold: kept but forced to
+    # REVIEW_REQUIRED, never auto-accepted. At/above review_threshold: still
+    # marked needs_review (recovery never auto-ACCEPTs -- see decision_engine
+    # for why no single non-Qwen signal may unilaterally accept).
+    review_threshold: 0.55
+    max_candidates_per_image: 6
+    # Rejected below min_pole_score in geometry terms.
+    min_aspect_ratio: 2.5   # height / width of the candidate OBB
+    max_aspect_ratio: 40.0
+    max_angle_from_vertical_deg: 25.0
+    min_width_px: 4.0
+    max_width_px: 120.0
+    # Duplicate suppression against existing DINO/SAM3 candidates -- rotated
+    # (Shapely polygon) IoU via src/geometry_obb.py::obb_iou, never
+    # axis-aligned.
+    duplicate_iou_threshold: 0.35
+    # Partial-pole reconstruction (extending a SAM3 mask that covers only
+    # part of a pole): how far past the observed mask's own extent the
+    # centerline search may extend, as a multiple of the observed segment's
+    # own length. Never extends blindly to the image border.
+    max_extension_factor: 2.0
+    # Multi-signal pole_score weights -- renormalized over whichever signals
+    # actually have evidence for a given candidate (e.g. no DINO evidence at
+    # all for a fully-missed pole), same renormalization pattern as
+    # decision.weights above. Do NOT need to sum to 1.0.
+    weights:
+      verticality: 0.15
+      elongation: 0.15
+      line_continuity: 0.15
+      edge_consistency: 0.10
+      width_consistency: 0.10
+      segmentation_agreement: 0.15
+      dino_agreement: 0.10
+      position_context: 0.10

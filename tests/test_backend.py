@@ -167,6 +167,87 @@ class TestBackendAPI(unittest.TestCase):
         pred = storage_mgr.get_predictions(ds_id, img_name)
         self.assertEqual(len(pred["boxes"]), 1)
 
+    def test_rejecting_a_recovery_candidate_on_save_records_active_learning_feedback(self):
+        """Spec: 'Every rejected recovered OBB should be stored as useful
+        hard-negative information.' A recovery candidate has no dedicated
+        reject button -- a human rejects it by simply not including it in
+        the saved boxes list (Delete/Reject on the canvas), same as any
+        other box. Saving without it must record a structured feedback
+        entry; saving WITH it must not."""
+        ds_id = "api_test_recovery_rejection"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Recovery Rejection Test", "classes": ["utility_pole"]})
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img_name = "recovery_test.jpg"
+        cv2.imwrite(str(img_dir / img_name), np.zeros((300, 300, 3), dtype=np.uint8))
+        storage_mgr.import_images(ds_id, [img_dir / img_name])
+
+        recovery_corners = [[95.0, 20.0], [105.0, 20.0], [105.0, 180.0], [95.0, 180.0]]
+        recovery_box = DetectionBox(
+            xyxy=(95, 20, 105, 180), corners=recovery_corners, confidence=0.6,
+            model_source="OBB_RECOVERY", needs_review=True,
+            attributes={
+                "recovery_score": {"pole_score": 0.6, "components": {"verticality": 1.0, "dino_agreement": 0.4}},
+                "recovery_status": "RECOVERED_CANDIDATE",
+            },
+        )
+        storage_mgr.save_predictions(ds_id, img_name, [recovery_box], raw_outputs={})
+
+        # Human rejects it: saves annotations WITHOUT this box present.
+        res = self.client.post(
+            f"/api/datasets/{ds_id}/images/{img_name}/annotations",
+            json={"boxes": [], "image_width": 300, "image_height": 300, "is_human": True, "action": "human_corrected"},
+        )
+        self.assertEqual(res.status_code, 200)
+
+        feedback = storage_mgr.get_recovery_feedback(ds_id)
+        self.assertEqual(len(feedback), 1)
+        self.assertEqual(feedback[0]["image_id"], img_name)
+        self.assertEqual(feedback[0]["final_human_decision"], "rejected")
+        self.assertEqual(feedback[0]["recovery_score"]["pole_score"], 0.6)
+        self.assertTrue(feedback[0]["dino_detected_nearby"])
+
+    def test_keeping_a_recovery_candidate_on_save_does_not_record_rejection(self):
+        ds_id = "api_test_recovery_kept"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Recovery Kept Test", "classes": ["utility_pole"]})
+        img_dir = Path(self.test_dir) / ds_id / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        img_name = "recovery_kept.jpg"
+        cv2.imwrite(str(img_dir / img_name), np.zeros((300, 300, 3), dtype=np.uint8))
+        storage_mgr.import_images(ds_id, [img_dir / img_name])
+
+        recovery_corners = [[95.0, 20.0], [105.0, 20.0], [105.0, 180.0], [95.0, 180.0]]
+        recovery_box = DetectionBox(
+            xyxy=(95, 20, 105, 180), corners=recovery_corners, confidence=0.6,
+            model_source="OBB_RECOVERY", needs_review=True,
+            attributes={"recovery_score": {"pole_score": 0.6, "components": {}}, "recovery_status": "RECOVERED_CANDIDATE"},
+        )
+        storage_mgr.save_predictions(ds_id, img_name, [recovery_box], raw_outputs={})
+
+        # Human accepts it as-is: saves annotations WITH this same box present.
+        res = self.client.post(
+            f"/api/datasets/{ds_id}/images/{img_name}/annotations",
+            json={
+                "boxes": [{"xyxy": [95, 20, 105, 180], "corners": recovery_corners, "confidence": 0.6, "model_source": "OBB_RECOVERY"}],
+                "image_width": 300, "image_height": 300, "is_human": True, "action": "accepted",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(storage_mgr.get_recovery_feedback(ds_id), [])
+
+    def test_recovery_feedback_endpoint_returns_recorded_rejections(self):
+        ds_id = "api_test_recovery_feedback_endpoint"
+        self.client.post("/api/datasets", json={"dataset_id": ds_id, "name": "Recovery Feedback Endpoint Test", "classes": ["utility_pole"]})
+        storage_mgr.record_recovery_rejection(ds_id, {
+            "image_id": "x.jpg", "proposed_obb": [[0, 0], [1, 0], [1, 1], [0, 1]],
+            "recovery_score": {"pole_score": 0.4}, "final_human_decision": "rejected",
+        })
+        res = self.client.get(f"/api/datasets/{ds_id}/active_learning/recovery_feedback")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["records"][0]["image_id"], "x.jpg")
+
     def test_dataset_lifecycle_and_annotations(self):
         """Test dataset creation, annotation saving, and differential tracking via API."""
         ds_id = "api_test_dataset"
