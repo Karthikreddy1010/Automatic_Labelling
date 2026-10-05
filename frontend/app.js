@@ -1883,6 +1883,29 @@ function setPositiveTags(tags) {
 }
 
 /**
+ * Advance to the image AFTER the one just actioned, having refreshed the
+ * gallery. Resolves the position by filename, not by the pre-reload index:
+ * loadDatasetImages() ends by calling selectImage(0), so reading
+ * state.activeImageIndex after it returns always yields 0, and "advancing"
+ * from there lands on image #2 of the list no matter which image was
+ * actually just actioned.
+ */
+async function reloadAndAdvancePast(filename, previousIndex) {
+  await loadDatasetImages(state.activeDatasetId);
+  if (state.images.length === 0) return;
+  const idx = state.images.findIndex(img => img.filename === filename);
+  if (idx >= 0) {
+    // Last image in the list: stay put rather than wrapping around.
+    selectImage(Math.min(idx + 1, state.images.length - 1));
+  } else {
+    // The image dropped out of the active status filter now that its status
+    // changed (e.g. viewing "Unlabeled" and we just labeled it) -- whatever
+    // shifted into its old slot is the next one to work on.
+    selectImage(Math.min(previousIndex, state.images.length - 1));
+  }
+}
+
+/**
  * Accept current AI predictions as ground truth without modifications.
  * Sends action='accepted' and positive AL categories to backend.
  */
@@ -1918,11 +1941,11 @@ async function acceptCurrentAnnotation() {
     setTimeout(() => elements.btnAccept.classList.remove('flash-success'), 600);
 
     setDirty(false);
-    // Refresh stats and advance to next image
-    await loadDatasetImages(state.activeDatasetId);
-    if (state.activeImageIndex < state.images.length - 1) {
-      selectImage(state.activeImageIndex + 1);
-    }
+    // Refresh stats and advance to next image. Capture identity BEFORE the
+    // reload -- loadDatasetImages() resets the selection to index 0.
+    const doneFilename = state.activeImageMeta.filename;
+    const doneIndex = state.activeImageIndex;
+    await reloadAndAdvancePast(doneFilename, doneIndex);
   } catch (err) {
     alert('Accept failed: ' + err.message);
   } finally {
@@ -1969,10 +1992,9 @@ async function saveEditsCurrentAnnotation() {
 
     setDirty(false);
     // Refresh stats and advance
-    await loadDatasetImages(state.activeDatasetId);
-    if (state.activeImageIndex < state.images.length - 1) {
-      selectImage(state.activeImageIndex + 1);
-    }
+    const doneFilename = state.activeImageMeta.filename;
+    const doneIndex = state.activeImageIndex;
+    await reloadAndAdvancePast(doneFilename, doneIndex);
   } catch (err) {
     alert('Save edits failed: ' + err.message);
   } finally {
@@ -2016,10 +2038,9 @@ async function confirmRejectCurrent() {
     setTimeout(() => elements.btnReject.classList.remove('flash-danger'), 600);
 
     setDirty(false);
-    await loadDatasetImages(state.activeDatasetId);
-    if (state.activeImageIndex < state.images.length - 1) {
-      selectImage(state.activeImageIndex + 1);
-    }
+    const doneFilename = state.activeImageMeta.filename;
+    const doneIndex = state.activeImageIndex;
+    await reloadAndAdvancePast(doneFilename, doneIndex);
   } catch (err) {
     alert('Reject failed: ' + err.message);
   } finally {
@@ -2041,10 +2062,9 @@ async function skipCurrentAnnotation() {
   } catch (err) {
     console.error('Skip failed:', err);
   }
-  await loadDatasetImages(state.activeDatasetId);
-  if (state.activeImageIndex < state.images.length - 1) {
-    selectImage(state.activeImageIndex + 1);
-  }
+  const doneFilename = state.activeImageMeta.filename;
+  const doneIndex = state.activeImageIndex;
+  await reloadAndAdvancePast(doneFilename, doneIndex);
 }
 
 /**
