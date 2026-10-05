@@ -99,6 +99,23 @@ The application will start the FastAPI server and automatically open your defaul
 | <kbd>F</kbd> | Fit zoom to screen |
 | <kbd>+</kbd> / <kbd>-</kbd> | Zoom in / Zoom out |
 | <kbd>?</kbd> | Open Keyboard Shortcuts Cheat Sheet |
+| <kbd>G</kbd> | Start the guided tour |
+
+---
+
+## Guided Tour
+
+A built-in walkthrough of the workspace, implemented in `frontend/tour.js`. It
+spotlights each part of the UI in turn -- dataset import, the AI Label and
+Batch Engine pipelines, the canvas and drawing tools, the Accept / Save Edits /
+Reject / Skip review verdicts, the evidence inspector, and the active-learning
+queue -- with <kbd>&larr;</kbd> / <kbd>&rarr;</kbd> to move and <kbd>Esc</kbd>
+to leave.
+
+It runs once automatically on a browser's first visit; after that the
+**Guide** button in the top navigation bar (or <kbd>G</kbd>) replays it. The
+"already seen" flag lives in `localStorage`, so clearing site data brings the
+first-run tour back.
 
 ---
 

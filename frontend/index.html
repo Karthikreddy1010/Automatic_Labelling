@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=9">
+  <link rel="stylesheet" href="style.css?v=10">
 </head>
 <body class="dark-theme">
   <!-- Top Navigation Bar -->
@@ -68,6 +68,10 @@
       <button id="btn-export-dataset" class="btn btn-outline" title="Export YOLO-OBB format">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path><polyline points="16 6 12 2 8 6"></polyline><line x1="12" y1="2" x2="12" y2="15"></line></svg>
         Export YOLO-OBB
+      </button>
+      <button id="btn-tour" class="btn btn-outline" title="Guided Tour (G)">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 17h.01"></path><path d="M12 13.5a2 2 0 0 1 .8-1.6 2.5 2.5 0 1 0-3.3-3.3"></path></svg>
+        Guide
       </button>
       <button id="btn-shortcuts" class="icon-btn" title="Keyboard Shortcuts (?)">?</button>
     </div>
@@ -530,9 +534,12 @@
           <tr><td><kbd>F</kbd></td><td>Fit canvas zoom to image</td></tr>
           <tr><td><kbd>+</kbd> / <kbd>-</kbd></td><td>Zoom in / out</td></tr>
           <tr><td><kbd>?</kbd></td><td>Toggle shortcuts modal</td></tr>
+          <tr><td><kbd>G</kbd></td><td>Start the guided tour</td></tr>
         </table>
       </div>
     </div>
+  </div>
+
   <!-- Detailed Reject Modal -->
   <div id="reject-modal" class="modal-overlay hidden">
     <div class="modal-card reject-modal-card">
@@ -573,6 +580,10 @@
     </div>
   </div>
 
-  <script src="app.js?v=11"></script>
+  <!-- Transient bottom-centre notice -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="tour.js?v=1"></script>
+  <script src="app.js?v=12"></script>
 </body>
 </html>

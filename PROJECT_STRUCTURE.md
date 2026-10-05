@@ -25,6 +25,8 @@ frontend/
 ├── index.html            # Single-page app shell
 ├── app.js                # All client logic: canvas rendering, box editing,
 │                          # undo/redo, API calls, active learning UI, batch modal
+├── tour.js               # Guided product tour (Guide button / G) -- spotlight
+│                          # walkthrough of the labeling workflow, self-contained
 └── style.css              # Roboflow-style dark theme
 
 models/

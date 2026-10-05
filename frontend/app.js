@@ -82,6 +82,7 @@ const elements = {
   btnBatchModal: document.getElementById('btn-batch-modal'),
   btnExportDataset: document.getElementById('btn-export-dataset'),
   btnShortcuts: document.getElementById('btn-shortcuts'),
+  btnTour: document.getElementById('btn-tour'),
   
   hardwareLabel: document.getElementById('hardware-label'),
   deviceSelect: document.getElementById('device-select'),
@@ -243,6 +244,7 @@ const elements = {
   btnStartUpload: document.getElementById('btn-start-upload'),
 
   shortcutsModal: document.getElementById('shortcuts-modal'),
+  toast: document.getElementById('toast'),
   btnCloseShortcutsModal: document.getElementById('btn-close-shortcuts-modal'),
 };
 
@@ -335,6 +337,9 @@ async function init() {
   await fetchHardware();
   await fetchModelStatus();
   await loadDatasets();
+
+  // First visit only -- afterwards the Guide button (or G) replays it.
+  if (window.PoleTour) window.PoleTour.maybeAutoStart();
 }
 
 async function fetchHardware() {
@@ -464,7 +469,30 @@ async function createNewDataset(id, name) {
   }
 }
 
-async function loadDatasetImages(datasetId) {
+/**
+ * Resolve which image a gallery reload should land on.
+ *
+ * `selection` is { prefer: [filename, ...], fallbackIndex: n } -- the first
+ * filename still present in the refreshed list wins. Resolving by filename
+ * rather than by index is what makes the review actions survive the image
+ * they just actioned dropping out of a status-filtered list, and any
+ * re-sort of the list, without the position quietly drifting.
+ */
+function resolveSelectionIndex(selection) {
+  const last = state.images.length - 1;
+  if (!selection) return 0;
+  for (const filename of selection.prefer || []) {
+    if (!filename) continue;
+    const idx = state.images.findIndex(img => img.filename === filename);
+    if (idx >= 0) return idx;
+  }
+  if (typeof selection.fallbackIndex === 'number') {
+    return Math.max(0, Math.min(selection.fallbackIndex, last));
+  }
+  return 0;
+}
+
+async function loadDatasetImages(datasetId, selection) {
   try {
     const filterParam = state.filterStatus === 'all' ? '' : `?status=${state.filterStatus}`;
     const data = await fetchJson(API_BASE + `api/datasets/${datasetId}/images${filterParam}`);
@@ -485,7 +513,10 @@ async function loadDatasetImages(datasetId) {
     loadDatasetComposition();
     
     if (state.images.length > 0) {
-      selectImage(0);
+      // Awaited, and targeted in one shot: a reload must never pass through
+      // index 0 on its way somewhere else, or whatever runs next reads a
+      // selection that was never the user's.
+      await selectImage(resolveSelectionIndex(selection));
     } else {
       state.activeImageIndex = -1;
       state.activeImageMeta = null;
@@ -1062,6 +1093,7 @@ function setupEventListeners() {
   elements.btnStartUpload.addEventListener('click', startStagedUpload);
 
   elements.btnShortcuts.addEventListener('click', () => elements.shortcutsModal.classList.toggle('hidden'));
+  if (elements.btnTour) elements.btnTour.addEventListener('click', () => startGuidedTour());
   elements.btnCloseShortcutsModal.addEventListener('click', () => elements.shortcutsModal.classList.add('hidden'));
   
   // Keyboard Shortcuts
@@ -1882,26 +1914,60 @@ function setPositiveTags(tags) {
   });
 }
 
+// Set while a review action (accept / save edits / reject / skip) is in
+// flight. Without it a double-click or a second keypress runs the action
+// again on the image still on screen, then both reloads advance -- so the
+// image in between is stepped over and never actually labelled.
+let reviewActionInFlight = false;
+
 /**
- * Advance to the image AFTER the one just actioned, having refreshed the
- * gallery. Resolves the position by filename, not by the pre-reload index:
- * loadDatasetImages() ends by calling selectImage(0), so reading
- * state.activeImageIndex after it returns always yields 0, and "advancing"
- * from there lands on image #2 of the list no matter which image was
- * actually just actioned.
+ * Snapshot which image is being actioned and which one comes after it,
+ * BEFORE the request goes out. Both have to be read up front: the user can
+ * navigate while the POST is in flight, and anything re-read afterwards
+ * describes wherever they ended up rather than the image that was saved --
+ * which is how an advance ends up landing on the wrong image entirely.
  */
-async function reloadAndAdvancePast(filename, previousIndex) {
-  await loadDatasetImages(state.activeDatasetId);
-  if (state.images.length === 0) return;
-  const idx = state.images.findIndex(img => img.filename === filename);
-  if (idx >= 0) {
-    // Last image in the list: stay put rather than wrapping around.
-    selectImage(Math.min(idx + 1, state.images.length - 1));
+function captureAdvanceTarget() {
+  const index = state.activeImageIndex;
+  const next = state.images[index + 1];
+  return {
+    filename: state.activeImageMeta ? state.activeImageMeta.filename : null,
+    nextFilename: next ? next.filename : null,
+    index,
+  };
+}
+
+/**
+ * Refresh the gallery and land on the image that followed the one just
+ * actioned, using the identity captured by captureAdvanceTarget().
+ *
+ * Ordering of preference, all by filename so nothing depends on indices
+ * that the reload may have shifted:
+ *   1. the image that was next at the time of the action;
+ *   2. the actioned image itself -- it was the last in the list, so there is
+ *      nothing after it and staying put is correct;
+ *   3. its old slot, clamped, when both are gone from a filtered list.
+ *
+ * Only (3) can move backwards, and only at the very end of a filtered list
+ * where every later image has already been reviewed, so it says so instead
+ * of silently jumping to an earlier image.
+ */
+async function reloadAndAdvancePast(target) {
+  await loadDatasetImages(state.activeDatasetId, {
+    prefer: [target.nextFilename, target.filename],
+    fallbackIndex: target.index,
+  });
+  if (state.images.length === 0 || !state.activeImageMeta) return;
+
+  // Say so whenever the review did not move forward, so reaching the end of
+  // a list never reads as the app jumping back on its own.
+  const landed = state.activeImageMeta.filename;
+  if (landed === target.nextFilename || state.activeImageIndex > target.index) return;
+  if (landed === target.filename) {
+    showToast('Last image in this list -- nothing after it.');
   } else {
-    // The image dropped out of the active status filter now that its status
-    // changed (e.g. viewing "Unlabeled" and we just labeled it) -- whatever
-    // shifted into its old slot is the next one to work on.
-    selectImage(Math.min(previousIndex, state.images.length - 1));
+    showToast(`End of this list: ${target.filename} was the last one. Showing the last image still in the ` +
+              `"${state.filterStatus}" filter -- switch the filter to carry on.`);
   }
 }
 
@@ -1916,11 +1982,14 @@ async function acceptCurrentAnnotation() {
     alert('Cannot save -- fix these OBBs first:\n\n' + validationErrors.join('\n'));
     return;
   }
+  if (reviewActionInFlight) return;
+  reviewActionInFlight = true;
+  const target = captureAdvanceTarget();
   const tags = getSelectedPositiveTags();
   showSpinner('Accepting annotation as ground truth...');
   try {
     const clamped = clampBoxesToImageBounds(state.boxes, state.imageObj.width, state.imageObj.height);
-    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`, {
+    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(target.filename)}/annotations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1941,14 +2010,12 @@ async function acceptCurrentAnnotation() {
     setTimeout(() => elements.btnAccept.classList.remove('flash-success'), 600);
 
     setDirty(false);
-    // Refresh stats and advance to next image. Capture identity BEFORE the
-    // reload -- loadDatasetImages() resets the selection to index 0.
-    const doneFilename = state.activeImageMeta.filename;
-    const doneIndex = state.activeImageIndex;
-    await reloadAndAdvancePast(doneFilename, doneIndex);
+    // Refresh stats and advance, using the identity captured before the POST.
+    await reloadAndAdvancePast(target);
   } catch (err) {
     alert('Accept failed: ' + err.message);
   } finally {
+    reviewActionInFlight = false;
     hideSpinner();
   }
 }
@@ -1964,11 +2031,14 @@ async function saveEditsCurrentAnnotation() {
     alert('Cannot save -- fix these OBBs first:\n\n' + validationErrors.join('\n'));
     return;
   }
+  if (reviewActionInFlight) return;
+  reviewActionInFlight = true;
+  const target = captureAdvanceTarget();
   const tags = getSelectedPositiveTags();
   showSpinner('Saving human corrections...');
   try {
     const clamped = clampBoxesToImageBounds(state.boxes, state.imageObj.width, state.imageObj.height);
-    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/annotations`, {
+    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(target.filename)}/annotations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1992,12 +2062,11 @@ async function saveEditsCurrentAnnotation() {
 
     setDirty(false);
     // Refresh stats and advance
-    const doneFilename = state.activeImageMeta.filename;
-    const doneIndex = state.activeImageIndex;
-    await reloadAndAdvancePast(doneFilename, doneIndex);
+    await reloadAndAdvancePast(target);
   } catch (err) {
     alert('Save edits failed: ' + err.message);
   } finally {
+    reviewActionInFlight = false;
     hideSpinner();
   }
 }
@@ -2021,10 +2090,13 @@ async function confirmRejectCurrent() {
   const failureType = elements.rejectFailureType.value;
   const negativeCategory = elements.rejectNegativeCategory.value;
   elements.rejectModal.classList.add('hidden');
-  
+
+  if (reviewActionInFlight) return;
+  reviewActionInFlight = true;
+  const target = captureAdvanceTarget();
   showSpinner('Recording negative / candidate failure...');
   try {
-    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/reject`, {
+    await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(target.filename)}/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2038,12 +2110,11 @@ async function confirmRejectCurrent() {
     setTimeout(() => elements.btnReject.classList.remove('flash-danger'), 600);
 
     setDirty(false);
-    const doneFilename = state.activeImageMeta.filename;
-    const doneIndex = state.activeImageIndex;
-    await reloadAndAdvancePast(doneFilename, doneIndex);
+    await reloadAndAdvancePast(target);
   } catch (err) {
     alert('Reject failed: ' + err.message);
   } finally {
+    reviewActionInFlight = false;
     hideSpinner();
   }
 }
@@ -2055,16 +2126,21 @@ async function confirmRejectCurrent() {
  */
 async function skipCurrentAnnotation() {
   if (!state.activeImageMeta) return;
+  if (reviewActionInFlight) return;
+  reviewActionInFlight = true;
+  const target = captureAdvanceTarget();
   try {
-    await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(state.activeImageMeta.filename)}/skip`, {
+    await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/images/${encodeURIComponent(target.filename)}/skip`, {
       method: 'POST',
     });
   } catch (err) {
     console.error('Skip failed:', err);
   }
-  const doneFilename = state.activeImageMeta.filename;
-  const doneIndex = state.activeImageIndex;
-  await reloadAndAdvancePast(doneFilename, doneIndex);
+  try {
+    await reloadAndAdvancePast(target);
+  } finally {
+    reviewActionInFlight = false;
+  }
 }
 
 /**
@@ -2212,9 +2288,7 @@ async function loadNextDifficultImage() {
       state.filterStatus = 'all';
       document.querySelectorAll('.filter-pill').forEach(p => p.classList.remove('active'));
       document.querySelector('.filter-pill[data-filter="all"]')?.classList.add('active');
-      await loadDatasetImages(state.activeDatasetId);
-      const newIdx = state.images.findIndex(img => img.filename === nextItem.filename);
-      if (newIdx >= 0) selectImage(newIdx);
+      await loadDatasetImages(state.activeDatasetId, { prefer: [nextItem.filename] });
     }
   } catch (err) {
     alert('Failed to load next difficult image: ' + err.message);
@@ -2576,9 +2650,22 @@ async function startStagedUpload() {
 
 // --- KEYBOARD SHORTCUTS ---
 
+/**
+ * Open the guided tour (tour.js). Any modal is dismissed first so the tour's
+ * spotlight is not fighting a dialog for the screen.
+ */
+function startGuidedTour() {
+  if (!window.PoleTour) return;
+  document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add('hidden'));
+  window.PoleTour.start();
+}
+
 function handleKeyDown(e) {
   // Ignore shortcuts when typing in an input
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  // The tour owns the keyboard while it is open -- otherwise its arrow keys
+  // would also be navigating images behind it.
+  if (window.PoleTour && window.PoleTour.isActive()) return;
 
   const ctrlOrCmd = e.ctrlKey || e.metaKey;
   if (ctrlOrCmd && (e.key === 'z' || e.key === 'Z')) {
@@ -2629,7 +2716,27 @@ function handleKeyDown(e) {
     elements.shortcutsModal.classList.toggle('hidden');
   } else if (e.key === 'q' || e.key === 'Q') {
     loadNextDifficultImage();
+  } else if (e.key === 'g' || e.key === 'G') {
+    startGuidedTour();
   }
+}
+
+// --- TOAST / SPINNER HELPERS ---
+
+let toastTimer = null;
+
+/**
+ * Transient bottom-centre notice. Used for things the user needs told but
+ * that must not interrupt them the way alert() does -- reaching the end of
+ * a filtered list, for instance.
+ */
+function showToast(message, ms = 4000) {
+  const el = elements.toast;
+  if (!el) return;
+  el.textContent = message;
+  el.classList.remove('hidden');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), ms);
 }
 
 // --- SPINNER HELPERS ---
