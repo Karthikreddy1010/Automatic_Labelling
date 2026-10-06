@@ -21,11 +21,27 @@ backend/
                          # mask/history CRUD, atomic+lock-guarded metadata,
                          # YOLO-OBB export
 
+requirements-core.txt     # Annotation-only install (no ML stack) -- the app
+                         # runs and the whole manual labeling workflow works
+requirements.txt          # Full install: adds torch/DINO/SAM/Qwen (superset)
+Dockerfile                # Annotation-only image: non-root, healthcheck,
+                         # datasets on a /data volume
+docker-compose.yml        # One-command deploy, published to loopback only
+DEPLOY.md                 # Deployment guide: proxying + auth, backups,
+                         # upgrades, troubleshooting
+.github/workflows/        # CI: the test suite on every PR (Python 3.11, 3.13)
+
 frontend/
 ├── index.html            # Single-page app shell
 ├── app.js                # All client logic: canvas rendering, box editing,
 │                          # undo/redo, API calls, active learning UI, batch modal
+├── tour.js               # Guided product tour (Guide button / G) -- spotlight
+│                          # walkthrough of the labeling workflow, self-contained
 └── style.css              # Roboflow-style dark theme
+
+tests/
+└── ml_guard.py           # skip markers so model-dependent tests report as
+                          # skipped, not failed, on an annotation-only install
 
 models/
 ├── best.pt, A_S.pt, yolo11n*.pt   # Trained/pretrained weights (benchmark-

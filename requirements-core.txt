@@ -1,0 +1,53 @@
+# PoleAnnotator AI -- CORE dependencies (annotation workspace only)
+# =================================================================
+#
+# This is everything the app needs to START and to run the complete manual
+# labeling workflow:
+#
+#   import images -> draw / edit / rotate 4-corner OBBs -> review, accept,
+#   reject, skip -> active-learning tags -> dataset balance & coverage ->
+#   export YOLO-OBB -> guided tour
+#
+# Measured install footprint: ~330 MB in a clean virtualenv, against the
+# several GB the full ML stack needs (torch + CUDA wheels alone dwarf it):
+#
+#     pip install -r requirements-core.txt
+#     python run_backend.py
+#
+# What you do NOT get with core-only: the AI buttons (AI Label, Run All,
+# Batch Engine, Refine SAM). Those report "model not installed" in the UI and
+# return HTTP 503 from the API -- they never crash the server. Add them with:
+#
+#     pip install -r requirements.txt        # full stack: torch, DINO, SAM, Qwen
+#
+# requirements.txt is a strict superset of this file; the pins match it
+# exactly, so installing both in either order is consistent.
+
+# Backend web server (backend/app.py)
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+python-multipart==0.0.32   # multipart/form-data image upload endpoint
+pydantic==2.13.3           # API request/response schemas
+
+# Image I/O and geometry -- used by the OBB editor, mask decoding and export
+numpy==2.3.3
+opencv-python-headless==4.13.0.92  # no GUI calls anywhere in the server; the
+                                   # headless wheel avoids pulling desktop GL
+                                   # libraries. requirements.txt installs the
+                                   # full opencv-python instead, which also
+                                   # satisfies every `import cv2` here.
+Pillow==12.3.0
+shapely==2.1.2             # OBB polygon validation / IoU (src/geometry_obb.py)
+
+# configs/config.yaml (geometry QA thresholds, decision weights, Qwen gating).
+# Optional at runtime -- backend/app.py falls back to documented defaults if
+# it is missing -- but without it your config.yaml tuning is silently ignored.
+pyyaml==6.0.3
+
+# Test suite. With these, `python -m unittest discover -s tests` is green on a
+# core install: the model-dependent tests report as skipped (tests/ml_guard.py)
+# rather than failing. Pins match requirements.txt.
+httpx==0.28.1              # fastapi.testclient transport
+pytest==9.0.3              # several test modules are pytest-style
+pytest-asyncio==1.4.0
+requests==2.32.5           # SAM3 HTTP-service client + its tests

@@ -1523,3 +1523,293 @@ body {
   margin-bottom: 14px;
   line-height: 1.4;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Transient toast notice                                                 */
+/* ---------------------------------------------------------------------- */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 86px;
+  transform: translateX(-50%);
+  max-width: 560px;
+  padding: 10px 16px;
+  background: var(--bg-panel-sub);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-panel);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  z-index: 1500;
+}
+.toast.hidden { display: none; }
+
+/* ---------------------------------------------------------------------- */
+/* Guided tour                                                            */
+/* ---------------------------------------------------------------------- */
+.tour-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+}
+
+/* The dim is the spotlight's own outer shadow, so the highlighted element
+   stays fully lit with no extra layers to keep in sync. */
+.tour-spotlight {
+  position: fixed;
+  border-radius: var(--radius-md);
+  box-shadow: 0 0 0 9999px rgba(4, 7, 12, 0.74);
+  border: 2px solid var(--color-accent);
+  pointer-events: none;
+  transition: left 0.18s ease, top 0.18s ease, width 0.18s ease, height 0.18s ease;
+}
+.tour-spotlight.tour-hidden {
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  border-color: transparent;
+}
+
+/* Lifts the highlighted element above the dim without moving it. It is made
+   click-through as well: the tour spotlights buttons like Accept and Reject,
+   and a click there must advance the tour, never fire the real action. */
+.tour-target {
+  position: relative;
+  z-index: 2001;
+  pointer-events: none;
+}
+
+.tour-card {
+  position: fixed;
+  width: 370px;
+  max-width: calc(100vw - 24px);
+  padding: 16px 18px 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-panel);
+  z-index: 2002;
+}
+.tour-card-centred {
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 440px;
+}
+.tour-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.tour-counter {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+.tour-skip {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--font-main);
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.tour-skip:hover { color: var(--text-secondary); text-decoration: underline; }
+
+.tour-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+.tour-body {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+.tour-body strong { color: var(--text-primary); font-weight: 600; }
+.tour-body em { color: var(--text-primary); font-style: normal; font-weight: 600; }
+.tour-body kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+  background: var(--bg-panel-sub);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+}
+.tour-chip {
+  display: inline-block;
+  padding: 0 5px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-primary);
+  background: var(--bg-hover);
+  border-radius: 3px;
+}
+
+.tour-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+.tour-progress {
+  flex: 1;
+  height: 4px;
+  min-width: 60px;
+  background: var(--bg-panel-sub);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.tour-progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--color-accent);
+  border-radius: 2px;
+  transition: width 0.2s ease;
+}
+.tour-nav { display: flex; gap: 8px; flex-shrink: 0; }
+.tour-btn {
+  padding: 6px 14px;
+  font-family: var(--font-main);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--bg-panel-sub);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.tour-btn:hover:not(:disabled) { background: var(--bg-hover); }
+.tour-btn:disabled { opacity: 0.4; cursor: default; }
+.tour-btn-primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: #fff;
+}
+.tour-btn-primary:hover:not(:disabled) { background: var(--color-accent-hover); }
+
+/* The tour drives navigation itself; stop the page scrolling underneath. */
+body.tour-running { overflow: hidden; }
+
+/* Batch job failure reason (e.g. AI models not installed) */
+.batch-error {
+  margin-top: 10px;
+  padding: 9px 12px;
+  background: rgba(248, 81, 73, 0.1);
+  border: 1px solid var(--color-red);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.batch-error.hidden { display: none; }
+
+/* ---------------------------------------------------------------------- */
+/* Image removal: gallery tools, multi-select and per-row remove          */
+/* ---------------------------------------------------------------------- */
+.gallery-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+.gallery-tools .btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+#btn-select-mode.active {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: #fff;
+}
+
+.gallery-selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 7px 10px;
+  background: var(--bg-panel-sub);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.gallery-selection-bar.hidden { display: none; }
+.selection-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gallery-check {
+  flex-shrink: 0;
+  margin-right: 8px;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+.gallery-item.selected-for-delete {
+  background: rgba(248, 81, 73, 0.12);
+  box-shadow: inset 2px 0 0 var(--color-red);
+}
+
+/* Per-row remove. Hidden until the row is hovered or focused, so the list
+   stays calm, but always reachable by keyboard. */
+.gallery-remove {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.gallery-item:hover .gallery-remove,
+.gallery-remove:focus-visible {
+  opacity: 1;
+}
+.gallery-remove:hover {
+  color: #fff;
+  background: var(--color-red);
+}
+
+/* Destructive icon button (delete dataset) -- muted until hovered, so the
+   most dangerous control in the nav does not read as a primary action. */
+.icon-btn-danger:hover:not(:disabled) {
+  color: #fff;
+  background: var(--color-red);
+  border-color: var(--color-red);
+}
+.icon-btn-danger:disabled {
+  opacity: 0.35;
+  cursor: default;
+}

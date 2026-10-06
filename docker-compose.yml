@@ -1,0 +1,39 @@
+# PoleAnnotator AI -- annotation workspace
+#
+#   docker compose up -d        start, http://localhost:8000
+#   docker compose logs -f      watch it come up
+#   docker compose down         stop (datasets survive in the named volume)
+#
+# See DEPLOY.md for reverse proxy, backups and the AI-pipeline variant.
+
+services:
+  poleannotator:
+    build: .
+    image: poleannotator:latest
+    container_name: poleannotator
+    restart: unless-stopped
+    ports:
+      # Published on loopback only. The app has NO authentication, so binding
+      # it to every interface puts an open editor of your datasets on the
+      # network. Put it behind a reverse proxy that handles auth before
+      # changing this to "8000:8000" -- DEPLOY.md has the details.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Datasets, annotations, predictions, masks, history and exports. This
+      # is the only state worth backing up; everything else is rebuildable
+      # from the image.
+      - poleannotator-data:/data
+    environment:
+      OBB_DATA_DIR: /data/datasets
+      # Credentialed cross-origin access for a UI served from somewhere else.
+      # Unset means same-origin use only, which is the normal setup.
+      # OBB_CORS_ORIGINS: "https://labels.example.com"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  poleannotator-data:

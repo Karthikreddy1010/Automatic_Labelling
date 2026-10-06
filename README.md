@@ -6,7 +6,39 @@ A local, high-performance AI annotation and auto-labeling platform specifically 
 
 ## Quick Start
 
-### 1. One-Command Launch
+### 1. Install
+
+There are two supported installs. Pick by whether you need the AI pipeline.
+
+**Annotation only** -- the full manual labeling workspace, ~330 MB:
+
+```bash
+pip install -r requirements-core.txt
+```
+
+**Full stack** -- adds AI auto-labeling (torch, Grounding DINO, SAM, Qwen), several GB:
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` is a superset of `requirements-core.txt` at identical pins,
+so you can start light and upgrade later without reinstalling anything.
+
+| | Annotation only | Full stack |
+|---|---|---|
+| Import images, draw / edit / rotate 4-corner OBBs | yes | yes |
+| Review: Accept / Save Edits / Reject / Skip | yes | yes |
+| Active-learning tags, dataset balance & coverage | yes | yes |
+| Fixed test set, duplicate scan, YOLO-OBB export | yes | yes |
+| Guided tour, keyboard shortcuts | yes | yes |
+| **AI Label / Run All / Batch Engine / Refine SAM** | **no** | yes |
+
+On an annotation-only install the AI buttons do not vanish or crash -- they
+report that the model is not installed and name the command that adds it. The
+server prints which mode it started in.
+
+### 2. One-Command Launch
 
 In your terminal or PowerShell inside the repository directory:
 
@@ -24,6 +56,28 @@ The application will start the FastAPI server and automatically open your defaul
 
 *(Interactive REST API documentation is available at `http://127.0.0.1:8000/docs`)*
 
+### 3. Run the tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+Green on either install. On an annotation-only install the tests that need real
+model weights report as **skipped** rather than failed (see `tests/ml_guard.py`).
+CI runs this on every pull request against Python 3.11 and 3.13.
+
+### 4. Or run it in Docker
+
+```bash
+docker compose up -d     # http://localhost:8000
+```
+
+`GET /api/health` reports status, whether the data directory is writable, and
+whether the AI models are loaded. **The app has no authentication** — put it
+behind a reverse proxy, VPN or SSH tunnel before exposing it to anyone else.
+See **[DEPLOY.md](DEPLOY.md)** for proxying, backups, upgrades and
+troubleshooting.
+
 ---
 
 ## Key Workflows
@@ -32,6 +86,30 @@ The application will start the FastAPI server and automatically open your defaul
 1. Click the **Import Images** button (arrow-up icon next to the dataset dropdown).
 2. Enter the local folder path containing your utility pole images (e.g. `eval_upload` or `C:\Users\dukar\OneDrive\Desktop\auto_annotation\img1`).
 3. Click **Import Images**. Images are indexed into the active dataset.
+
+### 1b. Removing Images (wrong batch?)
+Images can be taken back out of a dataset at any time, from the **Images**
+panel on the left:
+- **Undo upload** — removes every image added by the most recent import and
+  nothing else, so a wrong folder can be swapped for the right one. The whole
+  staged upload counts as one batch even though files upload individually.
+- **Select** — turns the list into a checklist; tick rows (or **All**) and
+  **Delete** them together.
+- Hovering any row shows an **×** to remove that one image.
+- **Clear all** — empties the dataset of images while keeping the dataset and
+  its classes, ready for a fresh import.
+- **Delete dataset** (trash icon next to the dataset dropdown) — removes the
+  whole dataset: images, labels, predictions, masks, history and exports. It
+  asks for confirmation and then for the dataset id to be typed back, since
+  this discards an entire labelling run in one action. The app switches to
+  another dataset afterwards, creating a fresh starter one if that was the
+  last.
+
+Removing an image also deletes its annotations, raw predictions, cached masks
+and correction history — otherwise re-importing a file of the same name would
+silently inherit the old labels. Every one of these actions asks for
+confirmation first and says how many of the images are already labelled;
+**Clear all** asks twice. None of them can be undone.
 
 ### 2. Single-Image AI Labeling
 - **AI Label** (production pipeline) — YOLO/`best.pt` is **never** used here:
@@ -99,6 +177,23 @@ The application will start the FastAPI server and automatically open your defaul
 | <kbd>F</kbd> | Fit zoom to screen |
 | <kbd>+</kbd> / <kbd>-</kbd> | Zoom in / Zoom out |
 | <kbd>?</kbd> | Open Keyboard Shortcuts Cheat Sheet |
+| <kbd>G</kbd> | Start the guided tour |
+
+---
+
+## Guided Tour
+
+A built-in walkthrough of the workspace, implemented in `frontend/tour.js`. It
+spotlights each part of the UI in turn -- dataset import, the AI Label and
+Batch Engine pipelines, the canvas and drawing tools, the Accept / Save Edits /
+Reject / Skip review verdicts, the evidence inspector, and the active-learning
+queue -- with <kbd>&larr;</kbd> / <kbd>&rarr;</kbd> to move and <kbd>Esc</kbd>
+to leave.
+
+It runs once automatically on a browser's first visit; after that the
+**Guide** button in the top navigation bar (or <kbd>G</kbd>) replays it. The
+"already seen" flag lives in `localStorage`, so clearing site data brings the
+first-run tour back.
 
 ---
 

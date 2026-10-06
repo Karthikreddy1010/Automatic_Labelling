@@ -11,7 +11,19 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional, Union
 import numpy as np
-import torch
+
+# torch is optional. Reviewing, editing and exporting labels needs none of the
+# ML stack, so the app must start -- and the whole annotation workflow must
+# work -- on a machine that has not installed multiple GB of CUDA wheels. Each
+# model adapter already imports its own heavy dependency lazily and reports
+# `unavailable` through is_available(); this keeps that promise true for the
+# server process itself, which otherwise died here at import time.
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised by the core-deps install
+    torch = None
+    TORCH_AVAILABLE = False
 
 
 @dataclass
@@ -38,7 +50,7 @@ def detect_hardware(requested_device: str = "AUTO") -> Tuple[str, HardwareInfo]:
     Strictly verifies CUDA without fake claims. If CUDA is requested but not
     available, falls back cleanly to CPU with accurate telemetry.
     """
-    cuda_avail = torch.cuda.is_available()
+    cuda_avail = bool(TORCH_AVAILABLE and torch.cuda.is_available())
     gpu_name = None
     vram_total = None
     vram_free = None

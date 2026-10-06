@@ -1,0 +1,38 @@
+# Keep the build context small and the image free of host-only state.
+.git
+.github
+.gitignore
+
+# Datasets live in a volume at /data, never baked into the image -- they are
+# large, change constantly, and would otherwise be a stale copy inside it.
+data/datasets
+data/raw
+data/processed
+
+# Model weights: the annotation-only image has no use for them, and they are
+# hundreds of MB each.
+models/*.pt
+models/**/*.pt
+models/**/*.safetensors
+models/**/*.bin
+
+# Local Python and tooling state
+__pycache__
+**/__pycache__
+*.py[cod]
+.venv
+venv
+*.egg-info
+.pytest_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# Legacy pipeline, kept in the repo for reference but not part of the app
+legacy
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+*.swp

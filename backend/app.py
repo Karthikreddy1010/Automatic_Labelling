@@ -104,6 +104,23 @@ def _load_verification_pipeline_config() -> Dict[str, Any]:
         return {}
 
 
+def _models_missing_detail(what: str) -> str:
+    """
+    Error text for an AI stage whose model is not installed.
+
+    The app deliberately runs without the ML stack (see requirements-core.txt),
+    so this is a routine, expected state -- the message therefore says what is
+    missing AND the exact command that fixes it, rather than a bare
+    "unavailable" the user has to go and decode.
+    """
+    return (
+        f"{what} is not installed, so AI labeling is unavailable. "
+        "Everything else still works -- you can draw, edit, review and export "
+        "labels by hand. To enable the AI pipeline, install the full model "
+        "stack with:  pip install -r requirements.txt"
+    )
+
+
 _verification_cfg = _load_verification_pipeline_config()
 GEOMETRY_QA_CONFIG = geometry_config_from_dict(_verification_cfg.get("geometry_qa"))
 DECISION_CONFIG = decision_config_from_dict(_verification_cfg.get("decision"))
@@ -261,6 +278,25 @@ async def lifespan(app: FastAPI):
             log.info(f"  – {name} not available (dependencies missing)")
             print(f"  – {name} not available (dependencies missing)")
 
+    # Say plainly which mode the app came up in. Core-only is a supported way
+    # to run -- the whole manual labeling workflow works -- so this is a note,
+    # not a warning, and it names the one command that changes it.
+    _ready = [n for n, a in adapters if getattr(a, "_status", None) == "ready"]
+    if not _ready:
+        banner = (
+            "\n  ANNOTATION-ONLY MODE -- no AI models installed.\n"
+            "    Working now : import images, draw/edit/rotate OBBs, review\n"
+            "                  (Accept/Save/Reject/Skip), active-learning tags,\n"
+            "                  coverage stats, YOLO-OBB export, guided tour.\n"
+            "    Needs models: AI Label, Run All, Batch Engine, Refine SAM.\n"
+            "                  These report 'model not installed' in the UI.\n"
+            "    Enable them : pip install -r requirements.txt\n"
+        )
+        log.info("Started in annotation-only mode (no AI models installed).")
+        print(banner)
+    else:
+        log.info("AI models ready: %s", ", ".join(_ready))
+
     yield
 
 
@@ -270,13 +306,58 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# CORS. The app serves its own frontend from the same origin, so same-origin
+# use needs no CORS at all -- this exists for running the UI from a separate
+# dev server or reverse proxy.
+#
+# `*` with allow_credentials=True is not a valid combination: browsers refuse
+# to send credentials to a wildcard origin, so the previous settings promised
+# something no browser honours while advertising a wide-open policy. Set
+# OBB_CORS_ORIGINS to a comma-separated allowlist to enable credentialed
+# cross-origin use; left unset, origins stay open but credentials are off,
+# which is what actually worked before.
+_cors_origins_env = os.environ.get("OBB_CORS_ORIGINS", "").strip()
+if _cors_origins_env:
+    _allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    _allow_credentials = True
+else:
+    _allow_origins = ["*"]
+    _allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allow_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/health")
+def health():
+    """
+    Liveness/readiness probe for containers, load balancers and uptime checks.
+
+    Deliberately cheap and dependency-free: it reports that the process is up
+    and can see its data directory, and never touches a model. A deployment
+    running annotation-only is healthy -- `models_loaded: []` is a normal
+    state, not a failure -- so orchestrators must not restart it for that.
+    """
+    data_dir = Path(storage_mgr.base_dir)
+    ready = [name for name, adapter in (
+        ("yolo", yolo_adapter),
+        ("grounding_dino", dino_adapter),
+        ("sam21", sam21_adapter),
+        ("sam3", sam3_adapter),
+    ) if getattr(adapter, "_status", None) == "ready"]
+    return {
+        "status": "ok",
+        "version": app.version,
+        "data_dir_writable": os.access(data_dir, os.W_OK) if data_dir.exists() else False,
+        "dataset_count": len(storage_mgr.list_datasets()),
+        "models_loaded": ready,
+        "mode": "full" if ready else "annotation-only",
+    }
 
 
 # --- REQUEST & RESPONSE SCHEMAS ---
@@ -293,6 +374,10 @@ class CreateDatasetRequest(BaseModel):
 
 class ImportImagesRequest(BaseModel):
     source_dir: str
+
+
+class DeleteImagesRequest(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
 
 
 class DetectionRequest(BaseModel):
@@ -419,6 +504,18 @@ def create_dataset(req: CreateDatasetRequest):
     return {"dataset": meta}
 
 
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset_endpoint(dataset_id: str):
+    """
+    Delete a dataset outright -- images, labels, predictions, masks, history
+    and exports. Irreversible; the UI confirms twice before calling it.
+    """
+    try:
+        return storage_mgr.delete_dataset(dataset_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.get("/api/datasets/{dataset_id}")
 def get_dataset(dataset_id: str):
     meta = storage_mgr.get_dataset(dataset_id)
@@ -439,14 +536,82 @@ def import_images_endpoint(dataset_id: str, req: ImportImagesRequest):
     if not p.exists():
         raise HTTPException(status_code=400, detail=f"Source path {req.source_dir} does not exist.")
     imported = storage_mgr.import_images(dataset_id, [p])
-    return {"imported_count": len(imported), "imported_images": imported}
+    batches = storage_mgr.get_import_batches(dataset_id)
+    return {
+        "imported_count": len(imported),
+        "imported_images": imported,
+        # So the UI can offer "undo this upload" without the user having to
+        # pick the files back out of the gallery one at a time.
+        "batch_id": batches[-1]["batch_id"] if batches else None,
+    }
 
 
 @app.post("/api/datasets/{dataset_id}/import_upload")
-async def import_uploaded_images_endpoint(dataset_id: str, files: List[UploadFile] = File(...)):
+async def import_uploaded_images_endpoint(
+    dataset_id: str,
+    files: List[UploadFile] = File(...),
+    batch_id: Optional[str] = Form(None),
+):
     payload = [(f.filename or "", await f.read()) for f in files]
-    imported = storage_mgr.import_uploaded_files(dataset_id, payload)
-    return {"imported_count": len(imported), "imported_images": imported}
+    # The browser sends one file per request but stamps them all with the same
+    # batch_id, so they stay one undoable upload.
+    imported = storage_mgr.import_uploaded_files(dataset_id, payload, batch_id=batch_id)
+    batches = storage_mgr.get_import_batches(dataset_id)
+    return {
+        "imported_count": len(imported),
+        "imported_images": imported,
+        "batch_id": batches[-1]["batch_id"] if batches else None,
+    }
+
+
+@app.delete("/api/datasets/{dataset_id}/images/{filename}")
+def delete_image_endpoint(dataset_id: str, filename: str):
+    """Remove one image and everything derived from it."""
+    try:
+        result = storage_mgr.delete_images(dataset_id, [filename])
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="Image not found in dataset.")
+    return result
+
+
+@app.post("/api/datasets/{dataset_id}/images/delete")
+def delete_images_endpoint(dataset_id: str, req: DeleteImagesRequest):
+    """Remove a selected set of images in one go."""
+    if not req.filenames:
+        raise HTTPException(status_code=400, detail="No filenames supplied.")
+    try:
+        return storage_mgr.delete_images(dataset_id, req.filenames)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/datasets/{dataset_id}/import_batches")
+def get_import_batches_endpoint(dataset_id: str):
+    """Recent uploads, newest last, so one can be undone."""
+    return {"batches": storage_mgr.get_import_batches(dataset_id)}
+
+
+@app.delete("/api/datasets/{dataset_id}/import_batches/{batch_id}")
+def delete_import_batch_endpoint(dataset_id: str, batch_id: str):
+    """Discard a whole upload -- the 'wrong folder' undo."""
+    try:
+        result = storage_mgr.delete_import_batch(dataset_id, batch_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="That upload has no images left to remove.")
+    return result
+
+
+@app.post("/api/datasets/{dataset_id}/clear_images")
+def clear_dataset_images_endpoint(dataset_id: str):
+    """Empty the dataset of images, keeping the dataset and its settings."""
+    try:
+        return storage_mgr.clear_dataset_images(dataset_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/api/datasets/{dataset_id}/images/{filename}")
@@ -1078,7 +1243,7 @@ def run_ai_pipeline(
         _t0 = time.perf_counter()
 
         if not dino_adapter.is_available():
-            raw_outputs["error"] = "DINO unavailable"
+            raw_outputs["error"] = _models_missing_detail("Grounding DINO")
             return [], raw_outputs
 
         _t_dino = time.perf_counter()
@@ -1132,7 +1297,7 @@ def run_ai_pipeline(
             return combined_candidates, raw_outputs
 
         if not (sam21_adapter.is_available() or sam3_adapter.is_available()):
-            raw_outputs["error"] = "SAM 2.1/SAM 3 unavailable"
+            raw_outputs["error"] = _models_missing_detail("SAM 2.1 / SAM 3")
             return [], raw_outputs
 
         with Image.open(str(img_path)) as _im:

@@ -11,6 +11,8 @@ Tests:
 
 import time
 import unittest
+
+from tests.ml_guard import requires_ml
 from pathlib import Path
 
 from models.adapters.dino_adapter import GroundingDINOAdapter
@@ -19,6 +21,7 @@ from backend.app import run_ai_pipeline
 from src.geometry_obb import signed_shoelace_area
 
 
+@requires_ml
 class TestPhase6DINO(unittest.TestCase):
 
     def test_real_dino_inference(self):

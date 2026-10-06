@@ -10,6 +10,10 @@ backend/app.py can swap between them via one config value.
 import base64
 import io
 import unittest
+
+from tests.ml_guard import module_installed
+if not module_installed("requests"):
+    raise unittest.SkipTest("needs requests -- pip install -r requirements.txt")
 from unittest.mock import patch, MagicMock
 
 import numpy as np
