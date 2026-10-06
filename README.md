@@ -64,6 +64,19 @@ python -m unittest discover -s tests -t .
 
 Green on either install. On an annotation-only install the tests that need real
 model weights report as **skipped** rather than failed (see `tests/ml_guard.py`).
+CI runs this on every pull request against Python 3.11 and 3.13.
+
+### 4. Or run it in Docker
+
+```bash
+docker compose up -d     # http://localhost:8000
+```
+
+`GET /api/health` reports status, whether the data directory is writable, and
+whether the AI models are loaded. **The app has no authentication** — put it
+behind a reverse proxy, VPN or SSH tunnel before exposing it to anyone else.
+See **[DEPLOY.md](DEPLOY.md)** for proxying, backups, upgrades and
+troubleshooting.
 
 ---
 

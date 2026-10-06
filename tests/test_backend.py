@@ -34,10 +34,15 @@ class TestBackendAPI(unittest.TestCase):
         cls.client = TestClient(app)
         cls.test_dir = tempfile.mkdtemp()
         # Override storage manager base_dir for test isolation
+        cls._saved_base_dir = storage_mgr.base_dir
         storage_mgr.base_dir = Path(cls.test_dir)
 
     @classmethod
     def tearDownClass(cls):
+        # Restore it: storage_mgr is a module-level singleton, so leaving it
+        # pointed at the deleted temp directory broke whichever test class
+        # happened to run next.
+        storage_mgr.base_dir = cls._saved_base_dir
         shutil.rmtree(cls.test_dir, ignore_errors=True)
 
     def test_hardware_endpoints(self):

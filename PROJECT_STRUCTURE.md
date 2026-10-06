@@ -24,6 +24,12 @@ backend/
 requirements-core.txt     # Annotation-only install (no ML stack) -- the app
                          # runs and the whole manual labeling workflow works
 requirements.txt          # Full install: adds torch/DINO/SAM/Qwen (superset)
+Dockerfile                # Annotation-only image: non-root, healthcheck,
+                         # datasets on a /data volume
+docker-compose.yml        # One-command deploy, published to loopback only
+DEPLOY.md                 # Deployment guide: proxying + auth, backups,
+                         # upgrades, troubleshooting
+.github/workflows/        # CI: the test suite on every PR (Python 3.11, 3.13)
 
 frontend/
 ├── index.html            # Single-page app shell

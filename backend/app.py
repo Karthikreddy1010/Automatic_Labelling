@@ -306,13 +306,58 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# CORS. The app serves its own frontend from the same origin, so same-origin
+# use needs no CORS at all -- this exists for running the UI from a separate
+# dev server or reverse proxy.
+#
+# `*` with allow_credentials=True is not a valid combination: browsers refuse
+# to send credentials to a wildcard origin, so the previous settings promised
+# something no browser honours while advertising a wide-open policy. Set
+# OBB_CORS_ORIGINS to a comma-separated allowlist to enable credentialed
+# cross-origin use; left unset, origins stay open but credentials are off,
+# which is what actually worked before.
+_cors_origins_env = os.environ.get("OBB_CORS_ORIGINS", "").strip()
+if _cors_origins_env:
+    _allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    _allow_credentials = True
+else:
+    _allow_origins = ["*"]
+    _allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allow_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/health")
+def health():
+    """
+    Liveness/readiness probe for containers, load balancers and uptime checks.
+
+    Deliberately cheap and dependency-free: it reports that the process is up
+    and can see its data directory, and never touches a model. A deployment
+    running annotation-only is healthy -- `models_loaded: []` is a normal
+    state, not a failure -- so orchestrators must not restart it for that.
+    """
+    data_dir = Path(storage_mgr.base_dir)
+    ready = [name for name, adapter in (
+        ("yolo", yolo_adapter),
+        ("grounding_dino", dino_adapter),
+        ("sam21", sam21_adapter),
+        ("sam3", sam3_adapter),
+    ) if getattr(adapter, "_status", None) == "ready"]
+    return {
+        "status": "ok",
+        "version": app.version,
+        "data_dir_writable": os.access(data_dir, os.W_OK) if data_dir.exists() else False,
+        "dataset_count": len(storage_mgr.list_datasets()),
+        "models_loaded": ready,
+        "mode": "full" if ready else "annotation-only",
+    }
 
 
 # --- REQUEST & RESPONSE SCHEMAS ---

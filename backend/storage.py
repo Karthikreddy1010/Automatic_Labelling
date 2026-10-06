@@ -225,8 +225,18 @@ class DatasetManager:
             return lock
 
     def list_datasets(self) -> List[Dict[str, Any]]:
-        """List all datasets available in base directory."""
+        """
+        List all datasets available in base directory.
+
+        A missing base directory reads as "no datasets" rather than raising:
+        in a deployment that means the data volume is not mounted yet, and
+        /api/health and the dataset list should report an empty, diagnosable
+        state instead of a 500. /api/health's data_dir_writable flags the
+        real problem.
+        """
         datasets = []
+        if not self.base_dir.is_dir():
+            return datasets
         for p in self.base_dir.iterdir():
             if p.is_dir() and (p / "metadata.json").exists():
                 try:

@@ -184,5 +184,64 @@ class TestGracefulDegradationAPI(unittest.TestCase):
         self.assertIn("not installed", detail)
 
 
+class TestHealthEndpoint(unittest.TestCase):
+    """
+    /api/health is what containers, load balancers and uptime checks poll, so
+    it must answer cheaply and must not call an annotation-only deployment
+    unhealthy -- that would restart a perfectly good service in a loop.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def test_health_is_ok_without_any_models(self):
+        res = self.client.get("/api/health")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertIn("version", body)
+        self.assertIsInstance(body["models_loaded"], list)
+        self.assertIn(body["mode"], ("full", "annotation-only"))
+
+    def test_health_reports_annotation_only_when_no_models_loaded(self):
+        body = self.client.get("/api/health").json()
+        if body["models_loaded"]:
+            self.skipTest("models are loaded; nothing to assert about the degraded mode")
+        self.assertEqual(body["mode"], "annotation-only")
+
+    def test_health_touches_no_model(self):
+        """Must stay cheap: a probe that loads a model would time out."""
+        from backend.app import dino_adapter
+        before = getattr(dino_adapter, "_status", None)
+        self.client.get("/api/health")
+        self.assertEqual(getattr(dino_adapter, "_status", None), before)
+
+
+class TestCorsConfiguration(unittest.TestCase):
+    """
+    `allow_origins=["*"]` together with `allow_credentials=True` is a
+    combination browsers refuse, so it advertised a wide-open policy while
+    delivering something no browser would use. Credentials are only enabled
+    alongside an explicit allowlist.
+    """
+
+    def test_wildcard_origin_never_ships_with_credentials(self):
+        from starlette.middleware.cors import CORSMiddleware
+        import backend.app as app_module
+
+        cors = next(
+            (m for m in app_module.app.user_middleware if m.cls is CORSMiddleware),
+            None,
+        )
+        self.assertIsNotNone(cors, "CORS middleware is not installed")
+        kwargs = cors.kwargs
+        if "*" in kwargs.get("allow_origins", []):
+            self.assertFalse(
+                kwargs.get("allow_credentials", False),
+                "allow_origins=['*'] with allow_credentials=True is rejected by browsers",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
