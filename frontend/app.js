@@ -90,6 +90,14 @@ const elements = {
   btnRefineSam: document.getElementById('btn-refine-sam'),
   btnBatchModal: document.getElementById('btn-batch-modal'),
   btnExportDataset: document.getElementById('btn-export-dataset'),
+  exportModal: document.getElementById('export-modal'),
+  exportOutputDir: document.getElementById('export-output-dir'),
+  exportCustomGroup: document.getElementById('export-custom-group'),
+  exportError: document.getElementById('export-error'),
+  exportDefaultHint: document.getElementById('export-default-hint'),
+  btnRunExport: document.getElementById('btn-run-export'),
+  btnCancelExport: document.getElementById('btn-cancel-export'),
+  btnCloseExportModal: document.getElementById('btn-close-export-modal'),
   btnShortcuts: document.getElementById('btn-shortcuts'),
   btnTour: document.getElementById('btn-tour'),
   
@@ -1258,7 +1266,7 @@ function setupEventListeners() {
   elements.btnAiLabel.addEventListener('click', () => triggerInference('AI_LABEL'));
   elements.btnRunAll.addEventListener('click', () => triggerInference('RUN_ALL'));
   elements.btnRefineSam.addEventListener('click', refineSelectedWithSAM);
-  elements.btnExportDataset.addEventListener('click', exportDataset);
+  elements.btnExportDataset.addEventListener('click', openExportModal);
   
   // Navigation & Save
   elements.btnPrevImg.addEventListener('click', () => selectImage(state.activeImageIndex - 1));
@@ -1304,6 +1312,13 @@ function setupEventListeners() {
   }
 
   // Image removal controls
+  if (elements.btnRunExport) elements.btnRunExport.addEventListener('click', runExport);
+  if (elements.btnCancelExport) elements.btnCancelExport.addEventListener('click', closeExportModal);
+  if (elements.btnCloseExportModal) elements.btnCloseExportModal.addEventListener('click', closeExportModal);
+  document.querySelectorAll('input[name="export_dest"]').forEach(r => {
+    r.addEventListener('change', syncExportModeUI);
+  });
+
   if (elements.btnDeleteDataset) elements.btnDeleteDataset.addEventListener('click', deleteCurrentDataset);
   if (elements.btnSelectMode) elements.btnSelectMode.addEventListener('click', () => setSelectMode(!state.selectMode));
   if (elements.btnExitSelect) elements.btnExitSelect.addEventListener('click', () => setSelectMode(false));
@@ -2528,17 +2543,7 @@ async function loadDatasetComposition() {
  */
 async function exportTestSet() {
   if (!state.activeDatasetId) return;
-  showSpinner('Exporting fixed test set benchmark...');
-  try {
-    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/export_test_set`, { method: 'POST' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    alert(`Fixed Test Set Export Complete!\n\nPath: ${data.result.export_path}\nImages Exported: ${data.result.count}`);
-  } catch (err) {
-    alert('Export test set failed: ' + err.message);
-  } finally {
-    hideSpinner();
-  }
+  await exportToSavedDir('export_test_set', 'Fixed test set');
 }
 
 /**
@@ -2667,32 +2672,114 @@ async function loadActiveLearningQueue() {
  */
 async function exportHardCases() {
   if (!state.activeDatasetId) return;
-  showSpinner('Exporting hard cases...');
-  try {
-    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/export_hard_cases?min_priority=60`, {
-      method: 'POST'
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const result = data.result;
-    alert(`Hard Cases Export Complete!\n\nExport Path: ${result.export_path || 'N/A'}\nImages: ${result.exported_count || 0}`);
-  } catch (err) {
-    alert('Export hard cases failed: ' + err.message);
-  } finally {
-    hideSpinner();
-  }
+  await exportToSavedDir('export_hard_cases?min_priority=60', 'Hard cases');
 }
 
 // --- DATASET EXPORT ---
 
-async function exportDataset() {
+// Where the user last chose to export to. Kept in localStorage so the folder
+// is picked once and reused, rather than retyped on every export.
+const EXPORT_DIR_KEY = 'poleannotator.exportDir';
+
+function getSavedExportDir() {
+  try { return localStorage.getItem(EXPORT_DIR_KEY) || ''; } catch (err) { return ''; }
+}
+
+function saveExportDir(dir) {
+  try {
+    if (dir) localStorage.setItem(EXPORT_DIR_KEY, dir);
+    else localStorage.removeItem(EXPORT_DIR_KEY);
+  } catch (err) { /* private mode -- the export still worked */ }
+}
+
+/** Open the destination chooser, pre-filled with whatever was used last. */
+function openExportModal() {
+  if (!state.activeDatasetId) return;
+  const saved = getSavedExportDir();
+  elements.exportOutputDir.value = saved;
+  // Default to the folder they chose before, if there is one -- that is the
+  // whole point of remembering it.
+  const mode = saved ? 'custom' : 'default';
+  document.querySelectorAll('input[name="export_dest"]').forEach(r => {
+    r.checked = r.value === mode;
+  });
+  if (elements.exportDefaultHint) {
+    elements.exportDefaultHint.textContent = `<data dir>/${state.activeDatasetId}/export`;
+  }
+  elements.exportError.classList.add('hidden');
+  syncExportModeUI();
+  elements.exportModal.classList.remove('hidden');
+  if (mode === 'custom') elements.exportOutputDir.focus();
+}
+
+function closeExportModal() {
+  elements.exportModal.classList.add('hidden');
+}
+
+function selectedExportMode() {
+  const picked = document.querySelector('input[name="export_dest"]:checked');
+  return picked ? picked.value : 'default';
+}
+
+function syncExportModeUI() {
+  const custom = selectedExportMode() === 'custom';
+  elements.exportCustomGroup.classList.toggle('disabled', !custom);
+}
+
+/**
+ * Run the export. A custom destination is only remembered once the server has
+ * accepted it, so a rejected path (relative, or outside OBB_EXPORT_ROOT) is
+ * not stored and silently retried on every future export.
+ */
+async function runExport() {
+  const custom = selectedExportMode() === 'custom';
+  const dir = custom ? elements.exportOutputDir.value.trim() : '';
+
+  if (custom && !dir) {
+    elements.exportError.textContent = 'Enter a destination folder, or choose the default location.';
+    elements.exportError.classList.remove('hidden');
+    return;
+  }
+
+  elements.exportError.classList.add('hidden');
+  elements.btnRunExport.disabled = true;
   showSpinner('Exporting YOLO-OBB dataset...');
   try {
-    const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/export`, { method: 'POST' });
-    const data = await res.json();
-    alert(`YOLO-OBB Export Successful!\n\nExport Path: ${data.result.export_path}\nImages Exported: ${data.result.exported_images}\nTrain: ${data.result.train_count}, Val: ${data.result.val_count}`);
+    const data = await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ output_dir: dir || null })
+    });
+    saveExportDir(custom ? dir : '');
+    closeExportModal();
+    const r = data.result;
+    showToast(`Exported ${r.exported_images} image${r.exported_images === 1 ? '' : 's'} ` +
+              `(${r.train_count} train / ${r.val_count} val) to ${r.export_path}`, 9000);
   } catch (err) {
-    alert('Export failed: ' + err.message);
+    // Keep the modal open with the message in place, so the path can be
+    // corrected without retyping it.
+    elements.exportError.textContent = err.message;
+    elements.exportError.classList.remove('hidden');
+  } finally {
+    elements.btnRunExport.disabled = false;
+    hideSpinner();
+  }
+}
+
+/** Test-set and hard-case exports reuse the same remembered folder. */
+async function exportToSavedDir(endpoint, label) {
+  const dir = getSavedExportDir();
+  showSpinner(`Exporting ${label}...`);
+  try {
+    const data = await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ output_dir: dir || null })
+    });
+    const r = data.result || {};
+    showToast(`${label} exported to ${r.export_path || 'the default location'}.`, 8000);
+  } catch (err) {
+    alert(`${label} export failed: ` + err.message);
   } finally {
     hideSpinner();
   }

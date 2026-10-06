@@ -1813,3 +1813,25 @@ body.tour-running { overflow: hidden; }
   opacity: 0.35;
   cursor: default;
 }
+
+/* Export destination modal */
+.radio-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.radio-row input { margin-top: 2px; accent-color: var(--color-accent); }
+.radio-row code,
+.modal-subtext code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 4px;
+  background: var(--bg-panel-sub);
+  border-radius: 3px;
+  color: var(--text-primary);
+}
+#export-custom-group.disabled { opacity: 0.45; pointer-events: none; }

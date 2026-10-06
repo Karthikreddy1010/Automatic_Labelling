@@ -1,7 +1,9 @@
 # Deploying PoleAnnotator AI
 
 > **Read this first: the app has no authentication.** Anyone who can reach the
-> port can view, edit, export and **delete** your datasets. Never publish it
+> port can view, edit, export and **delete** your datasets — and choose where
+> exports are written on the server's filesystem unless you set
+> `OBB_EXPORT_ROOT` (§4). Never publish it
 > straight to the internet. Put it behind something that authenticates — a
 > reverse proxy with basic auth or SSO, a VPN, or an SSH tunnel. The shipped
 > `docker-compose.yml` publishes to `127.0.0.1` only for exactly this reason.
@@ -99,6 +101,7 @@ All optional; the defaults are what runs locally.
 |---|---|---|
 | `OBB_DATA_DIR` | `data/datasets` | Where datasets, annotations, predictions, masks, history and exports live. **This is the only state worth backing up.** The image sets it to `/data/datasets`. |
 | `OBB_CORS_ORIGINS` | unset | Comma-separated origin allowlist for credentialed cross-origin requests, e.g. `https://labels.example.com`. Leave unset for normal same-origin use: the app serves its own frontend, so it needs no CORS. |
+| `OBB_EXPORT_ROOT` | unset | Confines user-chosen export destinations to this directory tree. **Set this in any deployment.** The export UI lets anyone choose where a dataset is written; unset, that is any absolute path the server process can write to. In the container, point it at a mounted volume, e.g. `/data/exports`. |
 | `QWEN_MODEL_PATH`, `QWEN_OLLAMA_MODEL`, `QWEN_API_KEY` | unset | Full-stack only — see the README's Qwen section. |
 
 Command-line: `python run_backend.py --host H --port P [--no-browser] [--reload]`.
