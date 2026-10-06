@@ -6,7 +6,39 @@ A local, high-performance AI annotation and auto-labeling platform specifically 
 
 ## Quick Start
 
-### 1. One-Command Launch
+### 1. Install
+
+There are two supported installs. Pick by whether you need the AI pipeline.
+
+**Annotation only** -- the full manual labeling workspace, ~330 MB:
+
+```bash
+pip install -r requirements-core.txt
+```
+
+**Full stack** -- adds AI auto-labeling (torch, Grounding DINO, SAM, Qwen), several GB:
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` is a superset of `requirements-core.txt` at identical pins,
+so you can start light and upgrade later without reinstalling anything.
+
+| | Annotation only | Full stack |
+|---|---|---|
+| Import images, draw / edit / rotate 4-corner OBBs | yes | yes |
+| Review: Accept / Save Edits / Reject / Skip | yes | yes |
+| Active-learning tags, dataset balance & coverage | yes | yes |
+| Fixed test set, duplicate scan, YOLO-OBB export | yes | yes |
+| Guided tour, keyboard shortcuts | yes | yes |
+| **AI Label / Run All / Batch Engine / Refine SAM** | **no** | yes |
+
+On an annotation-only install the AI buttons do not vanish or crash -- they
+report that the model is not installed and name the command that adds it. The
+server prints which mode it started in.
+
+### 2. One-Command Launch
 
 In your terminal or PowerShell inside the repository directory:
 
@@ -23,6 +55,15 @@ The application will start the FastAPI server and automatically open your defaul
 👉 **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
 
 *(Interactive REST API documentation is available at `http://127.0.0.1:8000/docs`)*
+
+### 3. Run the tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+Green on either install. On an annotation-only install the tests that need real
+model weights report as **skipped** rather than failed (see `tests/ml_guard.py`).
 
 ---
 

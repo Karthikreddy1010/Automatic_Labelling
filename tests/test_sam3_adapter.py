@@ -11,12 +11,15 @@ and load() should both return True and detect_and_segment/segment_box should
 return real DetectionBox/mask results instead of empty ones.
 """
 import unittest
+
+from tests.ml_guard import requires_ml
 from unittest.mock import MagicMock
 import numpy as np
 
 from models.adapters.sam3_adapter import SAM3Adapter
 
 
+@requires_ml
 class TestSAM3AdapterLoading(unittest.TestCase):
     def test_is_available_false_without_transformers_sam3_support(self):
         adapter = SAM3Adapter()
@@ -40,6 +43,7 @@ class TestSAM3AdapterLoading(unittest.TestCase):
         self.assertIn("backend", info.to_dict())
 
 
+@requires_ml
 class TestSAM3TextPrompt(unittest.TestCase):
     def test_detect_and_segment_on_unavailable_backend_returns_empty_list_not_crash(self):
         adapter = SAM3Adapter()
@@ -48,6 +52,7 @@ class TestSAM3TextPrompt(unittest.TestCase):
         self.assertIsInstance(result, list)  # [] when unavailable, never raises
 
 
+@requires_ml
 class TestSAM3BoxPrompt(unittest.TestCase):
     def test_segment_box_on_unavailable_backend_returns_none_not_crash(self):
         adapter = SAM3Adapter()
@@ -64,6 +69,7 @@ def _fake_pole_mask(h=100, w=100):
     return m
 
 
+@requires_ml
 class TestSAM3DetectAndSegmentAttachesMask(unittest.TestCase):
     """The service layer (services/sam3_service.py) needs to return masks
     alongside boxes/confidence for text-prompt detections -- detect_and_segment()
@@ -87,6 +93,7 @@ class TestSAM3DetectAndSegmentAttachesMask(unittest.TestCase):
         self.assertAlmostEqual(detections[0].confidence, 0.87, places=2)
 
 
+@requires_ml
 class TestSAM3SegmentBoxWithScore(unittest.TestCase):
     """segment_box() keeps its existing mask-only return for every other
     call site (backend/app.py etc.); segment_box_with_score() additionally

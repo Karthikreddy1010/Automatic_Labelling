@@ -218,6 +218,7 @@ const elements = {
   batchQwenGating: document.getElementById('batch-qwen-gating'),
   batchProgressFill: document.getElementById('batch-progress-fill'),
   batchStatusVal: document.getElementById('batch-status-val'),
+  batchError: document.getElementById('batch-error'),
   batchProgressVal: document.getElementById('batch-progress-val'),
   batchAcceptedVal: document.getElementById('batch-accepted-val'),
   batchReviewVal: document.getElementById('batch-review-val'),
@@ -2440,8 +2441,22 @@ async function pollBatchStatus() {
     
     const pct = job.total_images > 0 ? (job.processed_count / job.total_images) * 100 : 0;
     elements.batchProgressFill.style.width = `${pct}%`;
-    
-    if (job.status === 'completed' || job.status === 'cancelled' || job.status === 'idle') {
+
+    // Surface why a job stopped. The backend sets error_message (e.g. the AI
+    // models are not installed); without this the modal just showed "FAILED"
+    // with no reason anywhere in the UI.
+    if (elements.batchError) {
+      if (job.error_message) {
+        elements.batchError.textContent = job.error_message;
+        elements.batchError.classList.remove('hidden');
+      } else {
+        elements.batchError.classList.add('hidden');
+      }
+    }
+
+    // 'failed' is terminal too -- omitting it left the poll running forever
+    // and the Start button disabled, so the modal could never be used again.
+    if (['completed', 'cancelled', 'idle', 'failed'].includes(job.status)) {
       clearInterval(state.batchPollInterval);
       state.batchPollInterval = null;
       elements.btnStartBatch.disabled = false;

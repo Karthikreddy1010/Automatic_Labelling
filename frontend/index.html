@@ -7,7 +7,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=10">
+  <!-- Inline so the app needs no extra asset request (and no 404 for it). -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%238b5cf6%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%3E%3Cline%20x1%3D%2212%22%20y1%3D%222%22%20x2%3D%2212%22%20y2%3D%2222%22/%3E%3Cline%20x1%3D%226%22%20y1%3D%228%22%20x2%3D%2218%22%20y2%3D%228%22/%3E%3Cline%20x1%3D%228%22%20y1%3D%2214%22%20x2%3D%2216%22%20y2%3D%2214%22/%3E%3Ccircle%20cx%3D%2212%22%20cy%3D%225%22%20r%3D%222%22%20fill%3D%22%238b5cf6%22/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css?v=11">
 </head>
 <body class="dark-theme">
   <!-- Top Navigation Bar -->
@@ -456,6 +458,7 @@
             <span class="yellow">Needs Review: <strong id="batch-review-val">0</strong></span>
             <span class="red">Failed: <strong id="batch-failed-val">0</strong></span>
           </div>
+          <div id="batch-error" class="batch-error hidden"></div>
         </div>
       </div>
       <div class="modal-footer">
@@ -584,6 +587,6 @@
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <script src="tour.js?v=1"></script>
-  <script src="app.js?v=12"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

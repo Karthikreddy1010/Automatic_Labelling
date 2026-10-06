@@ -104,6 +104,23 @@ def _load_verification_pipeline_config() -> Dict[str, Any]:
         return {}
 
 
+def _models_missing_detail(what: str) -> str:
+    """
+    Error text for an AI stage whose model is not installed.
+
+    The app deliberately runs without the ML stack (see requirements-core.txt),
+    so this is a routine, expected state -- the message therefore says what is
+    missing AND the exact command that fixes it, rather than a bare
+    "unavailable" the user has to go and decode.
+    """
+    return (
+        f"{what} is not installed, so AI labeling is unavailable. "
+        "Everything else still works -- you can draw, edit, review and export "
+        "labels by hand. To enable the AI pipeline, install the full model "
+        "stack with:  pip install -r requirements.txt"
+    )
+
+
 _verification_cfg = _load_verification_pipeline_config()
 GEOMETRY_QA_CONFIG = geometry_config_from_dict(_verification_cfg.get("geometry_qa"))
 DECISION_CONFIG = decision_config_from_dict(_verification_cfg.get("decision"))
@@ -260,6 +277,25 @@ async def lifespan(app: FastAPI):
             adapter._error_msg = f"{name} dependencies not installed or not found."
             log.info(f"  – {name} not available (dependencies missing)")
             print(f"  – {name} not available (dependencies missing)")
+
+    # Say plainly which mode the app came up in. Core-only is a supported way
+    # to run -- the whole manual labeling workflow works -- so this is a note,
+    # not a warning, and it names the one command that changes it.
+    _ready = [n for n, a in adapters if getattr(a, "_status", None) == "ready"]
+    if not _ready:
+        banner = (
+            "\n  ANNOTATION-ONLY MODE -- no AI models installed.\n"
+            "    Working now : import images, draw/edit/rotate OBBs, review\n"
+            "                  (Accept/Save/Reject/Skip), active-learning tags,\n"
+            "                  coverage stats, YOLO-OBB export, guided tour.\n"
+            "    Needs models: AI Label, Run All, Batch Engine, Refine SAM.\n"
+            "                  These report 'model not installed' in the UI.\n"
+            "    Enable them : pip install -r requirements.txt\n"
+        )
+        log.info("Started in annotation-only mode (no AI models installed).")
+        print(banner)
+    else:
+        log.info("AI models ready: %s", ", ".join(_ready))
 
     yield
 
@@ -1078,7 +1114,7 @@ def run_ai_pipeline(
         _t0 = time.perf_counter()
 
         if not dino_adapter.is_available():
-            raw_outputs["error"] = "DINO unavailable"
+            raw_outputs["error"] = _models_missing_detail("Grounding DINO")
             return [], raw_outputs
 
         _t_dino = time.perf_counter()
@@ -1132,7 +1168,7 @@ def run_ai_pipeline(
             return combined_candidates, raw_outputs
 
         if not (sam21_adapter.is_available() or sam3_adapter.is_available()):
-            raw_outputs["error"] = "SAM 2.1/SAM 3 unavailable"
+            raw_outputs["error"] = _models_missing_detail("SAM 2.1 / SAM 3")
             return [], raw_outputs
 
         with Image.open(str(img_path)) as _im:

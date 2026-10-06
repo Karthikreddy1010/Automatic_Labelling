@@ -12,6 +12,8 @@ Tests:
 
 import time
 import unittest
+
+from tests.ml_guard import requires_ml
 import numpy as np
 import cv2
 
@@ -19,6 +21,7 @@ from models.adapters.yolo_adapter import YOLOAdapter
 from src.geometry_obb import signed_shoelace_area, is_clockwise_screen
 
 
+@requires_ml
 class TestPhase4YOLO(unittest.TestCase):
 
     def test_real_yolo_obb_inference(self):
