@@ -331,6 +331,10 @@ class ImportImagesRequest(BaseModel):
     source_dir: str
 
 
+class DeleteImagesRequest(BaseModel):
+    filenames: List[str] = Field(default_factory=list)
+
+
 class DetectionRequest(BaseModel):
     dataset_id: str
     filename: str
@@ -475,14 +479,82 @@ def import_images_endpoint(dataset_id: str, req: ImportImagesRequest):
     if not p.exists():
         raise HTTPException(status_code=400, detail=f"Source path {req.source_dir} does not exist.")
     imported = storage_mgr.import_images(dataset_id, [p])
-    return {"imported_count": len(imported), "imported_images": imported}
+    batches = storage_mgr.get_import_batches(dataset_id)
+    return {
+        "imported_count": len(imported),
+        "imported_images": imported,
+        # So the UI can offer "undo this upload" without the user having to
+        # pick the files back out of the gallery one at a time.
+        "batch_id": batches[-1]["batch_id"] if batches else None,
+    }
 
 
 @app.post("/api/datasets/{dataset_id}/import_upload")
-async def import_uploaded_images_endpoint(dataset_id: str, files: List[UploadFile] = File(...)):
+async def import_uploaded_images_endpoint(
+    dataset_id: str,
+    files: List[UploadFile] = File(...),
+    batch_id: Optional[str] = Form(None),
+):
     payload = [(f.filename or "", await f.read()) for f in files]
-    imported = storage_mgr.import_uploaded_files(dataset_id, payload)
-    return {"imported_count": len(imported), "imported_images": imported}
+    # The browser sends one file per request but stamps them all with the same
+    # batch_id, so they stay one undoable upload.
+    imported = storage_mgr.import_uploaded_files(dataset_id, payload, batch_id=batch_id)
+    batches = storage_mgr.get_import_batches(dataset_id)
+    return {
+        "imported_count": len(imported),
+        "imported_images": imported,
+        "batch_id": batches[-1]["batch_id"] if batches else None,
+    }
+
+
+@app.delete("/api/datasets/{dataset_id}/images/{filename}")
+def delete_image_endpoint(dataset_id: str, filename: str):
+    """Remove one image and everything derived from it."""
+    try:
+        result = storage_mgr.delete_images(dataset_id, [filename])
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="Image not found in dataset.")
+    return result
+
+
+@app.post("/api/datasets/{dataset_id}/images/delete")
+def delete_images_endpoint(dataset_id: str, req: DeleteImagesRequest):
+    """Remove a selected set of images in one go."""
+    if not req.filenames:
+        raise HTTPException(status_code=400, detail="No filenames supplied.")
+    try:
+        return storage_mgr.delete_images(dataset_id, req.filenames)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/datasets/{dataset_id}/import_batches")
+def get_import_batches_endpoint(dataset_id: str):
+    """Recent uploads, newest last, so one can be undone."""
+    return {"batches": storage_mgr.get_import_batches(dataset_id)}
+
+
+@app.delete("/api/datasets/{dataset_id}/import_batches/{batch_id}")
+def delete_import_batch_endpoint(dataset_id: str, batch_id: str):
+    """Discard a whole upload -- the 'wrong folder' undo."""
+    try:
+        result = storage_mgr.delete_import_batch(dataset_id, batch_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="That upload has no images left to remove.")
+    return result
+
+
+@app.post("/api/datasets/{dataset_id}/clear_images")
+def clear_dataset_images_endpoint(dataset_id: str):
+    """Empty the dataset of images, keeping the dataset and its settings."""
+    try:
+        return storage_mgr.clear_dataset_images(dataset_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/api/datasets/{dataset_id}/images/{filename}")

@@ -21,9 +21,11 @@ data/
 from __future__ import annotations
 import os
 import json
+import re
 import shutil
 import time
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -308,7 +310,12 @@ class DatasetManager:
         self._register_imported_images(dataset_id, imported)
         return imported
 
-    def import_uploaded_files(self, dataset_id: str, files: List[Tuple[str, bytes]]) -> List[str]:
+    def import_uploaded_files(
+        self,
+        dataset_id: str,
+        files: List[Tuple[str, bytes]],
+        batch_id: Optional[str] = None,
+    ) -> List[str]:
         """
         Import image files uploaded via the browser (filename, raw bytes) into
         the dataset images/ directory and update metadata. Used by the
@@ -331,10 +338,27 @@ class DatasetManager:
                 target.write_bytes(content)
             imported.append(name)
 
-        self._register_imported_images(dataset_id, imported)
+        self._register_imported_images(dataset_id, imported, batch_id=batch_id)
         return imported
 
-    def _register_imported_images(self, dataset_id: str, imported: List[str]) -> None:
+    def _register_imported_images(
+        self,
+        dataset_id: str,
+        imported: List[str],
+        batch_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Add newly-copied files to metadata under one import batch id.
+
+        `batch_id` lets a caller group several calls into one logical upload.
+        The browser uploads a staged selection one file per request (so it can
+        show per-file progress and retry failures individually); without a
+        shared id every file would become its own one-image "batch" and
+        "undo this upload" would only take back the last file.
+
+        Returns the batch id, or None when every file was already present --
+        callers surface it so the user can undo exactly this upload.
+        """
         ds_path = self.base_dir / dataset_id
         with self._lock_for(dataset_id):
             meta = self.get_dataset(dataset_id)
@@ -343,6 +367,10 @@ class DatasetManager:
 
             # Refresh images in metadata
             images_dict = meta.setdefault("images", {})
+            now = datetime.now(timezone.utc).isoformat()
+            batch_id = _safe_component(batch_id or "") or uuid.uuid4().hex[:12]
+            batch_names: List[str] = []
+
             for name in imported:
                 if name not in images_dict:
                     stem = Path(name).stem
@@ -362,11 +390,38 @@ class DatasetManager:
                         "needs_review": False,
                         "confidence": None,
                         "annotation_count": 0,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": now,
+                        # Which upload brought this image in. Lets the user
+                        # discard a whole batch they did not mean to add,
+                        # without hand-picking files out of the gallery.
+                        "import_batch": batch_id,
+                        "imported_at": now,
                     }
+                    batch_names.append(name)
+
+            # Only record a batch if it actually added something new -- a
+            # re-import of files already present must not leave an empty batch
+            # sitting in the list for the user to puzzle over.
+            if batch_names:
+                batches = meta.setdefault("import_batches", [])
+                existing = next((b for b in batches if b.get("batch_id") == batch_id), None)
+                if existing:
+                    # Another file of the same upload -- grow that batch rather
+                    # than logging a second one for the same user action.
+                    existing["count"] = existing.get("count", 0) + len(batch_names)
+                    existing["imported_at"] = now
+                else:
+                    batches.append({
+                        "batch_id": batch_id,
+                        "count": len(batch_names),
+                        "imported_at": now,
+                    })
+                # Keep this bounded; it is a convenience log, not an audit trail.
+                del batches[:-50]
 
             self._recount_stats(meta)
             self._update_metadata(dataset_id, meta)
+            return batch_id if batch_names else None
 
     def _recount_stats(self, meta: Dict[str, Any]) -> None:
         images = meta.get("images", {})
@@ -398,6 +453,136 @@ class DatasetManager:
             meta["images"][filename]["updated_at"] = datetime.now(timezone.utc).isoformat()
             self._recount_stats(meta)
             self._update_metadata(dataset_id, meta)
+
+    # --- IMAGE REMOVAL -------------------------------------------------
+    #
+    # Uploading the wrong folder is easy and, before this existed, permanent:
+    # there was no way to take images back out of a dataset short of editing
+    # metadata.json by hand. Removal has to take every derived artifact with
+    # the image, or the next import of a file with the same name silently
+    # inherits the old annotations, masks and history.
+
+    def _artifact_paths_for(self, dataset_id: str, filename: str) -> List[Path]:
+        """
+        Every file derived from one image: annotation JSON/TXT, raw
+        predictions, cached SAM masks and differential history records.
+
+        Masks are `<stem>_<boxindex>.png` and history is
+        `<stem>_<epoch_ms>.json`, so both are matched with an anchored regex
+        rather than a `<stem>_*` glob -- a glob would let image "pole1" claim
+        "pole1_closeup"'s files and delete another image's work.
+        """
+        ds_path = self.base_dir / dataset_id
+        stem = Path(filename).stem
+        paths = [
+            ds_path / "images" / filename,
+            ds_path / "annotations" / f"{stem}.json",
+            ds_path / "annotations" / f"{stem}.txt",
+            ds_path / "predictions" / f"{stem}.json",
+        ]
+        mask_re = re.compile(rf"^{re.escape(stem)}_\d+\.png$", re.IGNORECASE)
+        hist_re = re.compile(rf"^{re.escape(stem)}_\d+\.json$")
+        for sub, pattern in (("masks", mask_re), ("history", hist_re)):
+            d = ds_path / sub
+            if d.is_dir():
+                paths.extend(f for f in d.iterdir() if f.is_file() and pattern.match(f.name))
+        return paths
+
+    def delete_images(self, dataset_id: str, filenames: List[str]) -> Dict[str, Any]:
+        """
+        Permanently remove images and everything derived from them.
+
+        Returns {deleted, not_found, removed_files}. Unknown filenames are
+        reported rather than raised: a bulk delete should not abort halfway
+        because one name was stale, which would leave the dataset in a state
+        the user did not ask for and cannot easily reason about.
+        """
+        safe_id = _safe_component(dataset_id)
+        if not safe_id:
+            raise ValueError("Invalid dataset id.")
+
+        deleted: List[str] = []
+        not_found: List[str] = []
+        removed_files = 0
+
+        with self._lock_for(safe_id):
+            meta = self.get_dataset(safe_id)
+            if not meta:
+                raise ValueError(f"Dataset {dataset_id} does not exist.")
+            images = meta.get("images", {})
+
+            for raw_name in filenames:
+                name = _safe_component(raw_name)
+                if not name or name not in images:
+                    not_found.append(raw_name)
+                    continue
+                for path in self._artifact_paths_for(safe_id, name):
+                    try:
+                        if path.is_file():
+                            path.unlink()
+                            removed_files += 1
+                    except OSError:
+                        # A locked or already-gone file must not strand the
+                        # rest of the batch; metadata is still cleaned up so
+                        # the image stops appearing in the gallery.
+                        pass
+                images.pop(name, None)
+                deleted.append(name)
+
+            if deleted:
+                self._recount_stats(meta)
+                self._update_metadata(safe_id, meta)
+
+        return {"deleted": deleted, "not_found": not_found, "removed_files": removed_files}
+
+    def delete_import_batch(self, dataset_id: str, batch_id: str) -> Dict[str, Any]:
+        """
+        Remove every image that came in on one upload -- "I picked the wrong
+        folder, take it back out" -- leaving earlier imports untouched.
+        """
+        meta = self.get_dataset(dataset_id)
+        if not meta:
+            raise ValueError(f"Dataset {dataset_id} does not exist.")
+        names = [
+            name for name, entry in meta.get("images", {}).items()
+            if entry.get("import_batch") == batch_id
+        ]
+        result = self.delete_images(dataset_id, names)
+        with self._lock_for(_safe_component(dataset_id) or dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if meta:
+                meta["import_batches"] = [
+                    b for b in meta.get("import_batches", []) if b.get("batch_id") != batch_id
+                ]
+                self._update_metadata(dataset_id, meta)
+        result["batch_id"] = batch_id
+        return result
+
+    def clear_dataset_images(self, dataset_id: str) -> Dict[str, Any]:
+        """Empty a dataset of all images, keeping the dataset itself."""
+        meta = self.get_dataset(dataset_id)
+        if not meta:
+            raise ValueError(f"Dataset {dataset_id} does not exist.")
+        result = self.delete_images(dataset_id, list(meta.get("images", {}).keys()))
+        with self._lock_for(_safe_component(dataset_id) or dataset_id):
+            meta = self.get_dataset(dataset_id)
+            if meta:
+                meta["import_batches"] = []
+                self._update_metadata(dataset_id, meta)
+        return result
+
+    def get_import_batches(self, dataset_id: str) -> List[Dict[str, Any]]:
+        """Recent upload batches, newest last, with their surviving counts."""
+        meta = self.get_dataset(dataset_id)
+        if not meta:
+            return []
+        images = meta.get("images", {})
+        out = []
+        for batch in meta.get("import_batches", []):
+            remaining = sum(1 for e in images.values() if e.get("import_batch") == batch.get("batch_id"))
+            if remaining:
+                out.append({**batch, "remaining": remaining})
+        return out
 
     def get_image_path(self, dataset_id: str, filename: str) -> Optional[Path]:
         safe_id = _safe_component(dataset_id)

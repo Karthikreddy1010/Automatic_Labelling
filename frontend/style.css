@@ -1717,3 +1717,87 @@ body.tour-running { overflow: hidden; }
   line-height: 1.5;
 }
 .batch-error.hidden { display: none; }
+
+/* ---------------------------------------------------------------------- */
+/* Image removal: gallery tools, multi-select and per-row remove          */
+/* ---------------------------------------------------------------------- */
+.gallery-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+.gallery-tools .btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+#btn-select-mode.active {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: #fff;
+}
+
+.gallery-selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 7px 10px;
+  background: var(--bg-panel-sub);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.gallery-selection-bar.hidden { display: none; }
+.selection-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gallery-check {
+  flex-shrink: 0;
+  margin-right: 8px;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+.gallery-item.selected-for-delete {
+  background: rgba(248, 81, 73, 0.12);
+  box-shadow: inset 2px 0 0 var(--color-red);
+}
+
+/* Per-row remove. Hidden until the row is hovered or focused, so the list
+   stays calm, but always reachable by keyboard. */
+.gallery-remove {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.gallery-item:hover .gallery-remove,
+.gallery-remove:focus-visible {
+  opacity: 1;
+}
+.gallery-remove:hover {
+  color: #fff;
+  background: var(--color-red);
+}

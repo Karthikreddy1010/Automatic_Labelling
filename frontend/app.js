@@ -55,6 +55,13 @@ const state = {
   dragTarget: null,
   
   filterStatus: 'all',
+  // Image removal: `selectMode` turns the gallery into a checklist,
+  // `selectedForDelete` holds the ticked filenames (not indices -- the list
+  // is reloaded and re-sorted around them), and `lastImportBatchId` is the
+  // most recent upload, so a wrong folder can be taken back out in one go.
+  selectMode: false,
+  selectedForDelete: new Set(),
+  lastImportBatchId: null,
   layerVisibility: { yolo: true, dino: true, sam: true, recovery: true },
   labelFilter: 'all',   // 'all' | 'accept' | 'review' | 'reject' | 'disagreement' | 'geometry_warning' -- filters the per-image Labels list only
 
@@ -68,6 +75,7 @@ const state = {
 
   // Import modal staging queue: [{ id, file, url, status: 'pending'|'uploading'|'done'|'error', el }]
   importQueue: [],
+  importBatchId: null,   // groups this staged upload's per-file requests
   importUploading: false,
 };
 
@@ -112,6 +120,17 @@ const elements = {
   toggleSam: document.getElementById('toggle-sam'),
   toggleRecovery: document.getElementById('toggle-recovery'),
   
+  galleryTools: document.getElementById('gallery-tools'),
+  btnSelectMode: document.getElementById('btn-select-mode'),
+  btnUndoUpload: document.getElementById('btn-undo-upload'),
+  btnClearImages: document.getElementById('btn-clear-images'),
+  gallerySelectionBar: document.getElementById('gallery-selection-bar'),
+  selectionCount: document.getElementById('selection-count'),
+  btnSelectAll: document.getElementById('btn-select-all'),
+  btnSelectNone: document.getElementById('btn-select-none'),
+  btnDeleteSelected: document.getElementById('btn-delete-selected'),
+  btnExitSelect: document.getElementById('btn-exit-select'),
+
   btnPrevImg: document.getElementById('btn-prev-img'),
   btnNextImg: document.getElementById('btn-next-img'),
   paginationText: document.getElementById('image-pagination-text'),
@@ -508,10 +527,12 @@ async function loadDatasetImages(datasetId, selection) {
     elements.statUnlabeled.textContent = meta.unlabeled_count;
     
     renderGallery();
-    
+    updateSelectionUI();
+
     // Load active learning queue and dataset composition alongside gallery
     loadActiveLearningQueue();
     loadDatasetComposition();
+    refreshImportBatches();
     
     if (state.images.length > 0) {
       // Awaited, and targeted in one shot: a reload must never pass through
@@ -549,16 +570,205 @@ function renderGallery() {
     if (img.is_test_set) extraBadges += ' <span class="badge-mini test">TEST</span>';
     if (img.is_duplicate) extraBadges += ' <span class="badge-mini dup">DUP</span>';
     
+    const checked = state.selectedForDelete.has(img.filename);
+    if (state.selectMode && checked) item.classList.add('selected-for-delete');
+
     item.innerHTML = `
+      ${state.selectMode ? `<input type="checkbox" class="gallery-check" ${checked ? 'checked' : ''}
+         aria-label="Select ${img.filename}">` : ''}
       <div class="gallery-item-left">
         <span class="gallery-filename" title="${img.filename}">${img.filename}</span>
         ${extraBadges}
       </div>
       <span class="status-tag ${statusClass}">${img.status.replace('_', ' ')}</span>
+      <button class="gallery-remove" type="button" title="Remove ${img.filename} from this dataset"
+              aria-label="Remove ${img.filename}">&times;</button>
     `;
-    item.addEventListener('click', () => selectImage(idx));
+
+    if (state.selectMode) {
+      // In select mode the whole row toggles, so ticking many images is one
+      // click each rather than hunting for the checkbox.
+      item.addEventListener('click', () => toggleSelectedForDelete(img.filename));
+    } else {
+      item.addEventListener('click', () => selectImage(idx));
+    }
+    item.querySelector('.gallery-remove').addEventListener('click', (e) => {
+      e.stopPropagation();   // the row's own click would open the image instead
+      deleteImages([img.filename]);
+    });
     elements.imageGallery.appendChild(item);
   });
+}
+
+// --- IMAGE REMOVAL ---
+
+/**
+ * Summarise what deleting `filenames` destroys, so the confirmation names the
+ * work at stake rather than just a file count. Labels are the expensive part:
+ * images can be re-uploaded, hours of annotation cannot.
+ */
+function describeDeletion(filenames) {
+  const labelled = filenames.filter(f => {
+    const img = state.images.find(i => i.filename === f);
+    return img && ['verified', 'accepted', 'human_corrected'].includes(img.status);
+  }).length;
+  const what = filenames.length === 1 ? `"${filenames[0]}"` : `${filenames.length} images`;
+  let msg = `Remove ${what} from this dataset?\n\nThis also deletes their annotations, `
+          + `AI predictions, masks and correction history, and cannot be undone.`;
+  if (labelled > 0) {
+    msg += `\n\nWARNING: ${labelled} of them ${labelled === 1 ? 'is' : 'are'} already labelled — `
+         + `that work will be lost.`;
+  }
+  return msg;
+}
+
+/**
+ * Delete images, then land on whatever followed them. Reuses the same
+ * by-filename selection the review actions use, so the gallery does not jump
+ * back to the top of the list every time something is removed.
+ */
+async function deleteImages(filenames, { skipConfirm = false } = {}) {
+  if (!state.activeDatasetId || filenames.length === 0) return;
+  if (!skipConfirm && !confirm(describeDeletion(filenames))) return;
+
+  // Resolve the landing spot before the list changes under us: the first
+  // image still standing after the ones being removed.
+  const doomed = new Set(filenames);
+  const firstDoomed = state.images.findIndex(img => doomed.has(img.filename));
+  const survivor = firstDoomed < 0 ? null
+    : state.images.slice(firstDoomed + 1).find(img => !doomed.has(img.filename));
+  const fallbackIndex = Math.max(0, firstDoomed);
+
+  showSpinner(filenames.length === 1 ? 'Removing image...' : `Removing ${filenames.length} images...`);
+  try {
+    const res = await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/images/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filenames })
+    });
+    filenames.forEach(f => state.selectedForDelete.delete(f));
+    setDirty(false);
+    await loadDatasetImages(state.activeDatasetId, {
+      prefer: survivor ? [survivor.filename] : [],
+      fallbackIndex,
+    });
+    await refreshImportBatches();
+    updateSelectionUI();
+    const n = (res.deleted || []).length;
+    showToast(`Removed ${n} image${n === 1 ? '' : 's'}.`);
+  } catch (err) {
+    alert('Could not remove the image(s): ' + err.message);
+  } finally {
+    hideSpinner();
+  }
+}
+
+/** Discard every image added by the most recent upload. */
+async function undoLastUpload() {
+  if (!state.activeDatasetId || !state.lastImportBatchId) return;
+  const batchId = state.lastImportBatchId;
+  if (!confirm(
+    'Discard the most recent upload?\n\n'
+    + 'Every image it added is removed from this dataset, along with any '
+    + 'annotations made on them. Images that were already here are kept.'
+  )) return;
+
+  showSpinner('Discarding that upload...');
+  try {
+    const res = await fetchJson(
+      API_BASE + `api/datasets/${state.activeDatasetId}/import_batches/${batchId}`,
+      { method: 'DELETE' }
+    );
+    setDirty(false);
+    await loadDatasetImages(state.activeDatasetId);
+    await refreshImportBatches();
+    const n = (res.deleted || []).length;
+    showToast(`Discarded that upload — ${n} image${n === 1 ? '' : 's'} removed. You can import a different batch now.`);
+  } catch (err) {
+    alert('Could not discard that upload: ' + err.message);
+  } finally {
+    hideSpinner();
+  }
+}
+
+/** Empty the dataset of images, keeping the dataset itself. */
+async function clearAllImages() {
+  if (!state.activeDatasetId || state.images.length === 0) return;
+  const total = state.images.length;
+  if (!confirm(
+    `Remove ALL ${total} images from "${state.activeDatasetId}"?\n\n`
+    + 'Every image, annotation, prediction, mask and history record in this '
+    + 'dataset is deleted. The dataset itself and its classes are kept.\n\n'
+    + 'This cannot be undone.'
+  )) return;
+  // Second gate: this is the one action that can wipe a whole labelling run.
+  if (!confirm(`Last check — permanently delete all ${total} images and their labels?`)) return;
+
+  showSpinner('Removing all images...');
+  try {
+    const res = await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/clear_images`, {
+      method: 'POST'
+    });
+    state.selectedForDelete.clear();
+    setSelectMode(false);
+    setDirty(false);
+    await loadDatasetImages(state.activeDatasetId);
+    await refreshImportBatches();
+    showToast(`Dataset emptied — ${(res.deleted || []).length} images removed. Import a new batch to start over.`);
+  } catch (err) {
+    alert('Could not clear the dataset: ' + err.message);
+  } finally {
+    hideSpinner();
+  }
+}
+
+/** Ask the backend which uploads are still undoable. */
+async function refreshImportBatches() {
+  if (!state.activeDatasetId) return;
+  try {
+    const data = await fetchJson(API_BASE + `api/datasets/${state.activeDatasetId}/import_batches`);
+    const batches = data.batches || [];
+    state.lastImportBatchId = batches.length ? batches[batches.length - 1].batch_id : null;
+    const latest = batches[batches.length - 1];
+    if (elements.btnUndoUpload) {
+      elements.btnUndoUpload.classList.toggle('hidden', !latest);
+      if (latest) {
+        elements.btnUndoUpload.textContent = `Undo upload (${latest.remaining})`;
+        elements.btnUndoUpload.title =
+          `Remove the ${latest.remaining} image(s) added by the most recent upload`;
+      }
+    }
+  } catch (err) {
+    state.lastImportBatchId = null;
+    if (elements.btnUndoUpload) elements.btnUndoUpload.classList.add('hidden');
+  }
+}
+
+function toggleSelectedForDelete(filename) {
+  if (state.selectedForDelete.has(filename)) state.selectedForDelete.delete(filename);
+  else state.selectedForDelete.add(filename);
+  renderGallery();
+  updateSelectionUI();
+}
+
+function setSelectMode(on) {
+  state.selectMode = !!on;
+  if (!state.selectMode) state.selectedForDelete.clear();
+  elements.gallerySelectionBar.classList.toggle('hidden', !state.selectMode);
+  elements.btnSelectMode.classList.toggle('active', state.selectMode);
+  renderGallery();
+  updateSelectionUI();
+}
+
+function updateSelectionUI() {
+  const n = state.selectedForDelete.size;
+  if (elements.selectionCount) elements.selectionCount.textContent = `${n} selected`;
+  if (elements.btnDeleteSelected) {
+    elements.btnDeleteSelected.disabled = n === 0;
+    elements.btnDeleteSelected.textContent = n > 0 ? `Delete ${n}` : 'Delete';
+  }
+  if (elements.btnClearImages) elements.btnClearImages.disabled = state.images.length === 0;
+  if (elements.btnSelectMode) elements.btnSelectMode.disabled = state.images.length === 0;
 }
 
 async function selectImage(index) {
@@ -1024,6 +1234,28 @@ function setupEventListeners() {
       chip.addEventListener('click', () => setLabelFilter(chip.dataset.filter));
     });
   }
+
+  // Image removal controls
+  if (elements.btnSelectMode) elements.btnSelectMode.addEventListener('click', () => setSelectMode(!state.selectMode));
+  if (elements.btnExitSelect) elements.btnExitSelect.addEventListener('click', () => setSelectMode(false));
+  if (elements.btnUndoUpload) elements.btnUndoUpload.addEventListener('click', undoLastUpload);
+  if (elements.btnClearImages) elements.btnClearImages.addEventListener('click', clearAllImages);
+  if (elements.btnSelectAll) elements.btnSelectAll.addEventListener('click', () => {
+    state.images.forEach(img => state.selectedForDelete.add(img.filename));
+    renderGallery();
+    updateSelectionUI();
+  });
+  if (elements.btnSelectNone) elements.btnSelectNone.addEventListener('click', () => {
+    state.selectedForDelete.clear();
+    renderGallery();
+    updateSelectionUI();
+  });
+  if (elements.btnDeleteSelected) elements.btnDeleteSelected.addEventListener('click', () => {
+    const picked = state.images
+      .filter(img => state.selectedForDelete.has(img.filename))
+      .map(img => img.filename);
+    if (picked.length) deleteImages(picked);
+  });
 
   // Filter pills
   document.querySelectorAll('.filter-pill').forEach(pill => {
@@ -2561,9 +2793,24 @@ function removeFromStagingQueue(id) {
   updateStagingHeader();
 }
 
+/**
+ * Id for one upload session. crypto.randomUUID is not available on insecure
+ * origins in every browser, so fall back to a random hex string -- it only
+ * has to be unique among this dataset's recent uploads.
+ */
+function newImportBatchId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+    return window.crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+  }
+  return Math.random().toString(16).slice(2, 10) + Date.now().toString(16).slice(-4);
+}
+
 function clearStagingQueue() {
   state.importQueue.forEach(item => URL.revokeObjectURL(item.url));
   state.importQueue = [];
+  // Next upload is a new batch -- otherwise a later import would join the
+  // previous one and "Undo upload" would take back more than the user added.
+  state.importBatchId = null;
   elements.importThumbGrid.innerHTML = '';
   elements.importStaging.classList.add('hidden');
   updateStagingHeader();
@@ -2582,12 +2829,15 @@ function closeImportModal() {
   clearStagingQueue();
 }
 
-async function uploadOneStagedFile(item) {
+async function uploadOneStagedFile(item, batchId) {
   item.status = 'uploading';
   item.el.className = 'import-thumb state-uploading';
   try {
     const formData = new FormData();
     formData.append('files', item.file, item.file.name);
+    // Every file of one staged upload carries the same id so the server
+    // records them as a single batch the user can undo in one action.
+    if (batchId) formData.append('batch_id', batchId);
     const res = await fetch(API_BASE + `api/datasets/${state.activeDatasetId}/import_upload`, {
       method: 'POST',
       body: formData
@@ -2630,8 +2880,12 @@ async function startStagedUpload() {
     elements.importStagingCount.textContent = `Uploading ${done} / ${pending.length}...`;
   };
 
+  // One id for this whole upload, including files retried after a failure,
+  // so "Undo upload" takes back everything the user just added.
+  const batchId = state.importBatchId || (state.importBatchId = newImportBatchId());
+
   await runWithConcurrency(pending, async (item) => {
-    await uploadOneStagedFile(item);
+    await uploadOneStagedFile(item, batchId);
     updateProgress();
   }, IMPORT_UPLOAD_CONCURRENCY);
 
@@ -2660,6 +2914,15 @@ async function startStagedUpload() {
 
   if (!failed) {
     setTimeout(() => closeImportModal(), 900);
+    // Point at the way out while it is still fresh: picking the wrong folder
+    // is the usual reason someone wants these images gone again.
+    if (succeeded > 0) {
+      showToast(
+        `Imported ${succeeded} image${succeeded === 1 ? '' : 's'}. ` +
+        `Wrong batch? Use "Undo upload" in the Images panel to remove them and import a different one.`,
+        7000
+      );
+    }
   }
 }
 

@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <!-- Inline so the app needs no extra asset request (and no 404 for it). -->
   <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22%238b5cf6%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%3E%3Cline%20x1%3D%2212%22%20y1%3D%222%22%20x2%3D%2212%22%20y2%3D%2222%22/%3E%3Cline%20x1%3D%226%22%20y1%3D%228%22%20x2%3D%2218%22%20y2%3D%228%22/%3E%3Cline%20x1%3D%228%22%20y1%3D%2214%22%20x2%3D%2216%22%20y2%3D%2214%22/%3E%3Ccircle%20cx%3D%2212%22%20cy%3D%225%22%20r%3D%222%22%20fill%3D%22%238b5cf6%22/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="style.css?v=11">
+  <link rel="stylesheet" href="style.css?v=12">
 </head>
 <body class="dark-theme">
   <!-- Top Navigation Bar -->
@@ -93,6 +93,23 @@
         <button class="filter-pill" data-filter="unlabeled">Unlabeled</button>
         <button class="filter-pill" data-filter="ai_suggested">AI Suggested</button>
         <button class="filter-pill" data-filter="verified">Verified</button>
+      </div>
+
+      <!-- Removing images: undo a whole upload, or pick images out by hand -->
+      <div class="gallery-tools" id="gallery-tools">
+        <button id="btn-select-mode" class="btn btn-outline btn-xs" title="Pick images to remove">Select</button>
+        <button id="btn-undo-upload" class="btn btn-outline btn-xs hidden" title="Remove the images added by the most recent upload">Undo upload</button>
+        <button id="btn-clear-images" class="btn btn-outline btn-xs btn-outline-danger" title="Remove every image from this dataset">Clear all</button>
+      </div>
+
+      <div class="gallery-selection-bar hidden" id="gallery-selection-bar">
+        <span id="selection-count" class="selection-count">0 selected</span>
+        <div class="selection-actions">
+          <button id="btn-select-all" class="btn-link" type="button">All</button>
+          <button id="btn-select-none" class="btn-link" type="button">None</button>
+          <button id="btn-delete-selected" class="btn btn-danger btn-xs" type="button" disabled>Delete</button>
+          <button id="btn-exit-select" class="btn-link" type="button">Cancel</button>
+        </div>
       </div>
 
       <div class="dataset-stats-summary" id="dataset-stats-card">
@@ -586,7 +603,7 @@
   <!-- Transient bottom-centre notice -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
-  <script src="tour.js?v=1"></script>
-  <script src="app.js?v=13"></script>
+  <script src="tour.js?v=2"></script>
+  <script src="app.js?v=14"></script>
 </body>
 </html>

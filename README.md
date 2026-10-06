@@ -74,6 +74,24 @@ model weights report as **skipped** rather than failed (see `tests/ml_guard.py`)
 2. Enter the local folder path containing your utility pole images (e.g. `eval_upload` or `C:\Users\dukar\OneDrive\Desktop\auto_annotation\img1`).
 3. Click **Import Images**. Images are indexed into the active dataset.
 
+### 1b. Removing Images (wrong batch?)
+Images can be taken back out of a dataset at any time, from the **Images**
+panel on the left:
+- **Undo upload** — removes every image added by the most recent import and
+  nothing else, so a wrong folder can be swapped for the right one. The whole
+  staged upload counts as one batch even though files upload individually.
+- **Select** — turns the list into a checklist; tick rows (or **All**) and
+  **Delete** them together.
+- Hovering any row shows an **×** to remove that one image.
+- **Clear all** — empties the dataset of images while keeping the dataset and
+  its classes, ready for a fresh import.
+
+Removing an image also deletes its annotations, raw predictions, cached masks
+and correction history — otherwise re-importing a file of the same name would
+silently inherit the old labels. Every one of these actions asks for
+confirmation first and says how many of the images are already labelled;
+**Clear all** asks twice. None of them can be undone.
+
 ### 2. Single-Image AI Labeling
 - **AI Label** (production pipeline) — YOLO/`best.pt` is **never** used here:
   1. **Grounding DINO** proposes candidate boxes (open-vocabulary, text-prompted) — WHERE the pole might be. SAM 3's own candidate-proposal is available but off by default (`verification_pipeline.sam3.enable_candidate_proposal`) to avoid a redundant second SAM 3 call per candidate — see "Note on SAM 3" below.
