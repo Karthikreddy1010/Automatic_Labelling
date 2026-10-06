@@ -83,6 +83,7 @@ const state = {
 const elements = {
   datasetSelect: document.getElementById('dataset-select'),
   btnNewDataset: document.getElementById('btn-new-dataset'),
+  btnDeleteDataset: document.getElementById('btn-delete-dataset'),
   btnImportImages: document.getElementById('btn-import-images'),
   btnAiLabel: document.getElementById('btn-ai-label'),
   btnRunAll: document.getElementById('btn-run-all'),
@@ -425,27 +426,33 @@ async function fetchModelStatus() {
   }
 }
 
-async function loadDatasets() {
+async function loadDatasets(preferId) {
   try {
     const data = await fetchJson(API_BASE + 'api/datasets');
     state.datasets = data.datasets || [];
-    
+
     elements.datasetSelect.innerHTML = '';
     if (state.datasets.length === 0) {
       // Create initial dataset
       await createNewDataset('utility_poles_v1', 'Utility Poles Primary');
       return;
     }
-    
+
     state.datasets.forEach(ds => {
       const opt = document.createElement('option');
       opt.value = ds.dataset_id;
       opt.textContent = `${ds.name} (${ds.image_count})`;
       elements.datasetSelect.appendChild(opt);
     });
-    
-    state.activeDatasetId = state.datasets[0].dataset_id;
-    elements.datasetSelect.value = state.activeDatasetId;
+
+    // Stay where the caller asked (e.g. after deleting a different dataset)
+    // instead of always snapping back to the most recently updated one.
+    const wanted = state.datasets.some(ds => ds.dataset_id === preferId)
+      ? preferId
+      : state.datasets[0].dataset_id;
+    state.activeDatasetId = wanted;
+    elements.datasetSelect.value = wanted;
+    updateDatasetControls();
     await loadDatasetImages(state.activeDatasetId);
   } catch (err) {
     console.error('Failed to load datasets:', err);
@@ -472,6 +479,67 @@ async function promptCreateDataset() {
   }
 
   await createNewDataset(id, name.trim());
+}
+
+/**
+ * Delete the active dataset outright.
+ *
+ * The confirmation is deliberately heavier than the per-image one: this
+ * discards every image AND every label in the dataset at once, so it names
+ * the dataset and its contents, then asks the user to type the id. A stray
+ * double-click must not be able to destroy a labelling run.
+ */
+async function deleteCurrentDataset() {
+  const id = state.activeDatasetId;
+  if (!id) return;
+  const meta = state.datasets.find(ds => ds.dataset_id === id);
+  const label = meta ? meta.name : id;
+  const imageCount = meta ? (meta.image_count || 0) : state.images.length;
+  const verified = meta ? (meta.verified_count || 0) : 0;
+
+  let warning = `Delete the dataset "${label}" (${id}) and everything in it?\n\n`
+    + `${imageCount} image${imageCount === 1 ? '' : 's'}`;
+  if (verified > 0) warning += `, ${verified} of them already labelled`;
+  warning += `, plus all annotations, AI predictions, masks, correction history `
+    + `and exports.\n\nThis cannot be undone.`;
+  if (!confirm(warning)) return;
+
+  const typed = prompt(`To confirm, type the dataset id exactly:\n\n${id}`);
+  if (typed === null) return;
+  if (typed.trim() !== id) {
+    alert('That did not match the dataset id — nothing was deleted.');
+    return;
+  }
+
+  // Land on another dataset afterwards, not whichever happens to sort first.
+  const fallback = state.datasets.find(ds => ds.dataset_id !== id);
+
+  showSpinner('Deleting dataset...');
+  try {
+    await fetchJson(API_BASE + `api/datasets/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    setDirty(false);
+    state.selectedForDelete.clear();
+    setSelectMode(false);
+    state.activeDatasetId = fallback ? fallback.dataset_id : null;
+    // loadDatasets() recreates a starter dataset when the last one goes, so
+    // the app always comes back to a usable state rather than a dead screen.
+    await loadDatasets(fallback ? fallback.dataset_id : undefined);
+    showToast(`Deleted dataset "${label}".`);
+  } catch (err) {
+    alert('Could not delete the dataset: ' + err.message);
+  } finally {
+    hideSpinner();
+  }
+}
+
+/** Keep dataset-level controls in step with what is selected. */
+function updateDatasetControls() {
+  if (elements.btnDeleteDataset) {
+    elements.btnDeleteDataset.disabled = !state.activeDatasetId;
+    elements.btnDeleteDataset.title = state.activeDatasetId
+      ? `Delete "${state.activeDatasetId}" and everything in it`
+      : 'No dataset selected';
+  }
 }
 
 async function createNewDataset(id, name) {
@@ -1236,6 +1304,7 @@ function setupEventListeners() {
   }
 
   // Image removal controls
+  if (elements.btnDeleteDataset) elements.btnDeleteDataset.addEventListener('click', deleteCurrentDataset);
   if (elements.btnSelectMode) elements.btnSelectMode.addEventListener('click', () => setSelectMode(!state.selectMode));
   if (elements.btnExitSelect) elements.btnExitSelect.addEventListener('click', () => setSelectMode(false));
   if (elements.btnUndoUpload) elements.btnUndoUpload.addEventListener('click', undoLastUpload);
@@ -1270,6 +1339,7 @@ function setupEventListeners() {
   // Dataset change
   elements.datasetSelect.addEventListener('change', (e) => {
     state.activeDatasetId = e.target.value;
+    updateDatasetControls();
     loadDatasetImages(state.activeDatasetId);
   });
   

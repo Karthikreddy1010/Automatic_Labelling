@@ -236,6 +236,46 @@ class DatasetManager:
                     continue
         return sorted(datasets, key=lambda d: d.get("updated_at", ""), reverse=True)
 
+    def delete_dataset(self, dataset_id: str) -> Dict[str, Any]:
+        """
+        Permanently delete a whole dataset directory: images, annotations,
+        predictions, masks, history, exports and metadata.
+
+        This is the most destructive call in the app, so the target is pinned
+        down three ways before anything is removed: the id must be a bare path
+        segment, the resolved directory must sit directly inside base_dir, and
+        it must actually contain a metadata.json. Without those, a crafted id
+        could walk out of the data directory and rmtree something else.
+        """
+        safe_id = _safe_component(dataset_id)
+        if not safe_id:
+            raise ValueError("Invalid dataset id.")
+
+        base = self.base_dir.resolve()
+        ds_path = (self.base_dir / safe_id).resolve()
+        if ds_path.parent != base or ds_path == base:
+            raise ValueError("Invalid dataset id.")
+        if not (ds_path / "metadata.json").exists():
+            raise ValueError(f"Dataset {dataset_id} does not exist.")
+
+        meta = self.get_dataset(safe_id) or {}
+        image_count = len(meta.get("images", {}))
+
+        with self._lock_for(safe_id):
+            shutil.rmtree(ds_path)
+
+        # Drop the lock entry too, so a dataset later recreated under the same
+        # id does not inherit a lock held for the deleted one.
+        with self._metadata_locks_guard:
+            self._metadata_locks.pop(safe_id, None)
+
+        return {
+            "deleted": True,
+            "dataset_id": safe_id,
+            "name": meta.get("name", safe_id),
+            "image_count": image_count,
+        }
+
     def create_dataset(
         self,
         dataset_id: str,

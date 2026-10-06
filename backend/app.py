@@ -459,6 +459,18 @@ def create_dataset(req: CreateDatasetRequest):
     return {"dataset": meta}
 
 
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset_endpoint(dataset_id: str):
+    """
+    Delete a dataset outright -- images, labels, predictions, masks, history
+    and exports. Irreversible; the UI confirms twice before calling it.
+    """
+    try:
+        return storage_mgr.delete_dataset(dataset_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.get("/api/datasets/{dataset_id}")
 def get_dataset(dataset_id: str):
     meta = storage_mgr.get_dataset(dataset_id)

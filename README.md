@@ -85,6 +85,12 @@ panel on the left:
 - Hovering any row shows an **×** to remove that one image.
 - **Clear all** — empties the dataset of images while keeping the dataset and
   its classes, ready for a fresh import.
+- **Delete dataset** (trash icon next to the dataset dropdown) — removes the
+  whole dataset: images, labels, predictions, masks, history and exports. It
+  asks for confirmation and then for the dataset id to be typed back, since
+  this discards an entire labelling run in one action. The app switches to
+  another dataset afterwards, creating a fresh starter one if that was the
+  last.
 
 Removing an image also deletes its annotations, raw predictions, cached masks
 and correction history — otherwise re-importing a file of the same name would

@@ -32,7 +32,7 @@
       target: '.dataset-pill',
       prefer: 'bottom',
       title: '1. Your dataset',
-      body: 'Switch datasets here. <strong>+</strong> creates a new one, and the upload icon opens the importer -- drag in a folder of images, or paste a local path.',
+      body: 'Switch datasets here. <strong>+</strong> creates a new one, the upload icon opens the importer -- drag in a folder of images, or paste a local path -- and the bin deletes the whole dataset, labels and all, after asking you to type its id back.',
     },
     {
       target: '#btn-ai-label',

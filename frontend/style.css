@@ -1801,3 +1801,15 @@ body.tour-running { overflow: hidden; }
   color: #fff;
   background: var(--color-red);
 }
+
+/* Destructive icon button (delete dataset) -- muted until hovered, so the
+   most dangerous control in the nav does not read as a primary action. */
+.icon-btn-danger:hover:not(:disabled) {
+  color: #fff;
+  background: var(--color-red);
+  border-color: var(--color-red);
+}
+.icon-btn-danger:disabled {
+  opacity: 0.35;
+  cursor: default;
+}

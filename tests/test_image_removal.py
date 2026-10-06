@@ -194,6 +194,70 @@ class TestImportBatches(unittest.TestCase):
         self.assertEqual(list((self.dir / "d" / "images").iterdir()), [])
 
 
+class TestDeleteWholeDataset(unittest.TestCase):
+    """
+    Deleting a dataset rmtree's a directory built from a user-supplied id, so
+    the guards matter more than the happy path: a crafted id must never reach
+    outside the data directory.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.base = self.root / "datasets"
+        self.base.mkdir()
+        self.dm = DatasetManager(str(self.base))
+        self.dm.create_dataset("keepme", "Keep Me", ["utility_pole"])
+        self.dm.create_dataset("killme", "Kill Me", ["utility_pole"])
+        # Something outside the data directory that must survive everything.
+        self.outsider = self.root / "precious"
+        self.outsider.mkdir()
+        (self.outsider / "do_not_delete.txt").write_text("important")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_deletes_the_directory_and_reports_what_went(self):
+        src = _write_images(self.root / "src", ["a.jpg", "b.jpg"])
+        self.dm.import_images("killme", [src])
+
+        result = self.dm.delete_dataset("killme")
+
+        self.assertTrue(result["deleted"])
+        self.assertEqual(result["dataset_id"], "killme")
+        self.assertEqual(result["image_count"], 2)
+        self.assertFalse((self.base / "killme").exists())
+        self.assertIsNone(self.dm.get_dataset("killme"))
+        # Other datasets are untouched.
+        self.assertTrue((self.base / "keepme").exists())
+        self.assertEqual([d["dataset_id"] for d in self.dm.list_datasets()], ["keepme"])
+
+    def test_unknown_dataset_raises(self):
+        with self.assertRaises(ValueError):
+            self.dm.delete_dataset("never_existed")
+
+    def test_traversal_ids_are_refused_and_delete_nothing(self):
+        for bad in ["../precious", "..", ".", "", "../../tmp", "keepme/../precious"]:
+            with self.subTest(dataset_id=bad):
+                with self.assertRaises(ValueError):
+                    self.dm.delete_dataset(bad)
+        self.assertTrue((self.outsider / "do_not_delete.txt").exists())
+        self.assertTrue((self.base / "keepme").exists())
+
+    def test_a_directory_without_metadata_is_not_a_dataset(self):
+        stray = self.base / "not_a_dataset"
+        stray.mkdir()
+        (stray / "something.txt").write_text("x")
+        with self.assertRaises(ValueError):
+            self.dm.delete_dataset("not_a_dataset")
+        self.assertTrue(stray.exists())
+
+    def test_id_can_be_reused_after_deletion(self):
+        self.dm.delete_dataset("killme")
+        meta = self.dm.create_dataset("killme", "Kill Me Again", ["utility_pole"])
+        self.assertEqual(meta["dataset_id"], "killme")
+        self.assertEqual(meta["images"], {})
+
+
 class TestRemovalAPI(unittest.TestCase):
 
     @classmethod
@@ -271,6 +335,22 @@ class TestRemovalAPI(unittest.TestCase):
         self.assertEqual(listed, [])
         # Dataset itself still exists and can take a fresh batch.
         self.assertEqual(self.client.get("/api/datasets/api_clear").status_code, 200)
+
+    def test_delete_dataset_endpoint(self):
+        self._fresh("api_doomed", ["a.jpg"])
+        self.assertEqual(self.client.get("/api/datasets/api_doomed").status_code, 200)
+
+        res = self.client.delete("/api/datasets/api_doomed")
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json()["deleted"])
+
+        self.assertEqual(self.client.get("/api/datasets/api_doomed").status_code, 404)
+        listed = [d["dataset_id"] for d in self.client.get("/api/datasets").json()["datasets"]]
+        self.assertNotIn("api_doomed", listed)
+
+    def test_delete_unknown_dataset_is_404(self):
+        res = self.client.delete("/api/datasets/no_such_dataset")
+        self.assertEqual(res.status_code, 404)
 
     def test_upload_response_reports_its_batch_id(self):
         self._fresh("api_reports", ["a.jpg"])
