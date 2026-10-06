@@ -151,10 +151,20 @@ confirmation first and says how many of the images are already labelled;
 6. Pause, Resume, or Cancel anytime.
 
 ### 6. Exporting YOLO-OBB Dataset
-- Click **Export YOLO-OBB**:
+- Click **Export YOLO-OBB** and choose where it goes:
+  - **Default** — inside the dataset's own folder (`<data dir>/<dataset>/export`).
+  - **A folder you choose** — any absolute path on the machine running the
+    server (`D:\datasets\poles_yolo_obb`, `/home/me/poles`, `~/poles`). It is
+    created if missing, and **remembered** for the next export, including the
+    Export Test Set and Export Hard buttons.
   - Validates coordinate ranges $[0.0, 1.0]$.
   - Verifies signed shoelace area $> 0$ (clockwise).
   - Generates standard YOLO-OBB directory structure (`images/train`, `images/val`, `labels/train`, `labels/val`) and `data.yaml`.
+
+  The path is on the **server's** filesystem, which is the same machine when you
+  run it locally, and the container when you run it in Docker. In a deployment,
+  set `OBB_EXPORT_ROOT` to confine exports to one directory tree — see
+  [DEPLOY.md](DEPLOY.md).
 
 ---
 

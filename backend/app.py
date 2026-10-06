@@ -104,6 +104,75 @@ def _load_verification_pipeline_config() -> Dict[str, Any]:
         return {}
 
 
+# Optional confinement for user-chosen export destinations. Unset is right for
+# the desktop case this app was built for; set it in any deployment where the
+# port is reachable by someone you would not hand a shell to.
+EXPORT_ROOT = os.environ.get("OBB_EXPORT_ROOT", "").strip()
+
+
+def _resolve_export_dir(output_dir: Optional[str]) -> Optional[Path]:
+    """
+    Validate a user-supplied export destination.
+
+    Returns None to mean "use the dataset's default export/ directory".
+
+    An export writes directories and files wherever it is told, so the path is
+    checked rather than trusted:
+      * it must be absolute -- a relative path resolves against the server's
+        working directory, which the person typing it cannot see, so it would
+        land somewhere neither of us predicted;
+      * it must not already exist as a file;
+      * with OBB_EXPORT_ROOT set, it must resolve inside that root, which is
+        what stops a reachable deployment being told to write into /etc or a
+        home directory.
+    """
+    if not output_dir or not output_dir.strip():
+        return None
+
+    raw = output_dir.strip()
+
+    # `~` is expanded, but only after deciding whether the path was absolute:
+    # expanding first would turn the relative-looking "~" into "/root" and let
+    # it through the check below, exporting into the home directory of
+    # whoever runs the server. Tilde paths are unambiguous, so they are
+    # allowed deliberately rather than by accident.
+    looks_absolute = Path(raw).is_absolute() or raw.startswith("~")
+    if not looks_absolute:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Export path must be absolute, got '{raw}'. A relative path would be "
+                "resolved against the server's working directory, not yours."
+            ),
+        )
+
+    candidate = Path(raw).expanduser()
+    resolved = candidate.resolve()
+    if resolved.exists() and not resolved.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Export path '{resolved}' already exists and is not a directory.",
+        )
+
+    if EXPORT_ROOT:
+        root = Path(EXPORT_ROOT).expanduser().resolve()
+        if resolved != root and root not in resolved.parents:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Export path must be inside OBB_EXPORT_ROOT ({root}). "
+                    f"'{resolved}' is outside it."
+                ),
+            )
+
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Cannot write to '{resolved}': {e}")
+
+    return resolved
+
+
 def _models_missing_detail(what: str) -> str:
     """
     Error text for an AI stage whose model is not installed.
@@ -378,6 +447,12 @@ class ImportImagesRequest(BaseModel):
 
 class DeleteImagesRequest(BaseModel):
     filenames: List[str] = Field(default_factory=list)
+
+
+class ExportRequest(BaseModel):
+    # Absolute path on the machine running the server. None/empty keeps the
+    # dataset's default export/ directory.
+    output_dir: Optional[str] = None
 
 
 class DetectionRequest(BaseModel):
@@ -744,10 +819,13 @@ def get_differential_history(dataset_id: str, filename: Optional[str] = None):
 
 
 @app.post("/api/datasets/{dataset_id}/export")
-def export_dataset_endpoint(dataset_id: str):
+def export_dataset_endpoint(dataset_id: str, req: Optional[ExportRequest] = None):
+    out = _resolve_export_dir(req.output_dir if req else None)
     try:
-        res = storage_mgr.export_dataset(dataset_id)
+        res = storage_mgr.export_dataset(dataset_id, output_dir=out)
         return {"message": "Export completed successfully", "result": res}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -778,10 +856,17 @@ def get_next_difficult_endpoint(dataset_id: str):
 
 
 @app.post("/api/datasets/{dataset_id}/export_hard_cases")
-def export_hard_cases_endpoint(dataset_id: str, min_priority: int = Query(60)):
+def export_hard_cases_endpoint(
+    dataset_id: str,
+    min_priority: int = Query(60),
+    req: Optional[ExportRequest] = None,
+):
+    out = _resolve_export_dir(req.output_dir if req else None)
     try:
-        res = storage_mgr.export_hard_cases(dataset_id, min_priority=min_priority)
+        res = storage_mgr.export_hard_cases(dataset_id, output_dir=out, min_priority=min_priority)
         return {"message": "Hard cases export completed", "result": res}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -810,10 +895,13 @@ def get_test_set_endpoint(dataset_id: str):
 
 
 @app.post("/api/datasets/{dataset_id}/export_test_set")
-def export_test_set_endpoint(dataset_id: str):
+def export_test_set_endpoint(dataset_id: str, req: Optional[ExportRequest] = None):
+    out = _resolve_export_dir(req.output_dir if req else None)
     try:
-        res = storage_mgr.export_test_set(dataset_id)
+        res = storage_mgr.export_test_set(dataset_id, output_dir=out)
         return {"message": "Test set exported successfully", "result": res}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

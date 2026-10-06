@@ -25,6 +25,10 @@ services:
       - poleannotator-data:/data
     environment:
       OBB_DATA_DIR: /data/datasets
+      # Confine user-chosen export destinations to the mounted volume. Without
+      # this, the export dialog can write a dataset anywhere the container's
+      # user can reach.
+      OBB_EXPORT_ROOT: /data/exports
       # Credentialed cross-origin access for a UI served from somewhere else.
       # Unset means same-origin use only, which is the normal setup.
       # OBB_CORS_ORIGINS: "https://labels.example.com"
