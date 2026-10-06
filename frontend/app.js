@@ -540,6 +540,21 @@ async function deleteCurrentDataset() {
   }
 }
 
+/**
+ * Rewrite one dataset's dropdown entry (and its cached copy) from fresh
+ * metadata, so the count beside the name tracks imports and deletions
+ * without needing the whole dataset list reloaded.
+ */
+function refreshDatasetOption(meta) {
+  if (!meta || !meta.dataset_id) return;
+  const cached = state.datasets.find(ds => ds.dataset_id === meta.dataset_id);
+  if (cached) Object.assign(cached, meta);
+  const opt = elements.datasetSelect
+    ? elements.datasetSelect.querySelector(`option[value="${CSS.escape(meta.dataset_id)}"]`)
+    : null;
+  if (opt) opt.textContent = `${meta.name} (${meta.image_count})`;
+}
+
 /** Keep dataset-level controls in step with what is selected. */
 function updateDatasetControls() {
   if (elements.btnDeleteDataset) {
@@ -601,6 +616,11 @@ async function loadDatasetImages(datasetId, selection) {
     elements.statVerified.textContent = meta.verified_count;
     elements.statReview.textContent = meta.needs_review_count;
     elements.statUnlabeled.textContent = meta.unlabeled_count;
+    // The dropdown label carries the image count too. Only loadDatasets()
+    // used to write it, so after an import or a delete it kept showing the
+    // count from whenever the dataset list was last fetched -- "(0)" next to
+    // a gallery full of images.
+    refreshDatasetOption(meta);
     
     renderGallery();
     updateSelectionUI();
