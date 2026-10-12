@@ -125,6 +125,93 @@ class TestRunsWithoutMLStack(unittest.TestCase):
         self.assertEqual(mismatched, [], "requirements drift:\n  " + "\n  ".join(mismatched))
 
 
+class TestPackaging(unittest.TestCase):
+    """
+    pyproject.toml is what `pip install poleannotator` actually reads, so its
+    dependency list has to stay in step with requirements-core.txt -- otherwise
+    someone installing the package gets a different set of libraries from
+    someone installing the requirements file, and only one of them is tested.
+    """
+
+    @staticmethod
+    def _pyproject():
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+            import tomli as tomllib
+        return tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _pins(path):
+        out = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#")[0].strip()
+            m = re.match(r"^([A-Za-z0-9_.\-]+)(\[[^\]]+\])?==(.+)$", line)
+            if m:
+                out[m.group(1).lower()] = m.group(3).strip()
+        return out
+
+    @staticmethod
+    def _spec_pins(specs):
+        out = {}
+        for spec in specs:
+            m = re.match(r"^([A-Za-z0-9_.\-]+)(\[[^\]]+\])?==(.+)$", spec.strip())
+            if m:
+                out[m.group(1).lower()] = m.group(3).strip()
+        return out
+
+    def test_runtime_dependencies_match_requirements_core(self):
+        proj = self._pyproject()["project"]
+        declared = self._spec_pins(proj["dependencies"])
+        core = self._pins(REPO_ROOT / "requirements-core.txt")
+
+        # requirements-core.txt also carries the test runner; the package's
+        # runtime dependencies deliberately do not.
+        dev_only = set(self._spec_pins(proj["optional-dependencies"]["dev"]))
+        core_runtime = {k: v for k, v in core.items() if k not in dev_only}
+
+        self.assertEqual(
+            declared, core_runtime,
+            "pyproject dependencies and requirements-core.txt have drifted:\n"
+            f"  only in pyproject: {sorted(set(declared) - set(core_runtime))}\n"
+            f"  only in requirements-core: {sorted(set(core_runtime) - set(declared))}\n"
+            f"  version mismatches: {sorted(k for k in set(declared) & set(core_runtime) if declared[k] != core_runtime[k])}",
+        )
+
+    def test_ai_extra_matches_the_full_requirements(self):
+        """`pip install poleannotator[ai]` must give the same stack as requirements.txt."""
+        proj = self._pyproject()["project"]
+        ai = self._spec_pins(proj["optional-dependencies"]["ai"])
+        full = self._pins(REPO_ROOT / "requirements.txt")
+        mismatched = [f"{n}: pyproject={v} requirements={full.get(n)}"
+                      for n, v in ai.items() if full.get(n) != v]
+        self.assertEqual(mismatched, [], "the [ai] extra has drifted from requirements.txt:\n  "
+                                         + "\n  ".join(mismatched))
+
+    def test_console_script_points_at_a_real_callable(self):
+        proj = self._pyproject()["project"]
+        target = proj["scripts"]["poleannotator"]
+        module_name, _, func_name = target.partition(":")
+        module = importlib.import_module(module_name)
+        self.assertTrue(callable(getattr(module, func_name, None)),
+                        f"{target} is not callable")
+
+    def test_frontend_and_configs_ship_with_the_package(self):
+        """
+        The app serves its own UI and reads configs/config.yaml, so both must be
+        declared -- a wheel without them installs and then 404s the whole UI.
+        """
+        tool = self._pyproject()["tool"]["setuptools"]
+        for pkg in ("backend", "models", "models.adapters", "src", "services",
+                    "frontend", "configs"):
+            self.assertIn(pkg, tool["packages"], f"{pkg} would not be installed")
+        data = tool["package-data"]
+        self.assertTrue(any(p.endswith(".html") for p in data["frontend"]))
+        self.assertTrue(any(p.endswith(".js") for p in data["frontend"]))
+        self.assertTrue(any(p.endswith(".css") for p in data["frontend"]))
+        self.assertTrue(any(p.endswith(".yaml") for p in data["configs"]))
+
+
 class TestGracefulDegradationAPI(unittest.TestCase):
 
     @classmethod

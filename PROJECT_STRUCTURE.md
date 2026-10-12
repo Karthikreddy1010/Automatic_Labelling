@@ -21,6 +21,9 @@ backend/
                          # mask/history CRUD, atomic+lock-guarded metadata,
                          # YOLO-OBB export
 
+pyproject.toml            # Package metadata: `pip install .` pulls every
+                         # dependency and installs the `poleannotator` command.
+                         # [ai] extra adds the ML stack.
 requirements-core.txt     # Annotation-only install (no ML stack) -- the app
                          # runs and the whole manual labeling workflow works
 requirements.txt          # Full install: adds torch/DINO/SAM/Qwen (superset)

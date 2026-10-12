@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poleannotator"
+version = "2.0.0"
+description = "Local Roboflow-style oriented-bounding-box annotation workspace for electric utility pole detection"
+readme = "README.md"
+requires-python = ">=3.11"
+# SPDX string + license-files, not the deprecated `{ file = ... }` table,
+# which setuptools stops supporting in Feb 2027.
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["annotation", "labeling", "obb", "oriented-bounding-box", "yolo", "computer-vision"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: FastAPI",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Environment :: Web Environment",
+]
+
+# Installing the package installs these too, so there is no separate
+# "now pip install the requirements" step. Pins match requirements-core.txt
+# exactly -- a test asserts they cannot drift apart.
+dependencies = [
+    "fastapi==0.136.1",
+    "uvicorn[standard]==0.46.0",
+    "python-multipart==0.0.32",
+    "pydantic==2.13.3",
+    "numpy==2.3.3",
+    "opencv-python-headless==4.13.0.92",
+    "Pillow==12.3.0",
+    "shapely==2.1.2",
+    "pyyaml==6.0.3",
+    "requests==2.32.5",
+]
+
+[project.optional-dependencies]
+# The AI pipeline: several GB, and practically a GPU. Without it the app still
+# runs the whole manual labeling workflow and the AI buttons report that the
+# model is not installed.
+#     pip install "poleannotator[ai]"
+ai = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "transformers==4.57.0",
+    "accelerate==1.10.1",
+    "safetensors==0.6.2",
+    "huggingface-hub==0.35.3",
+    "ultralytics==8.4.45",
+    "scipy==1.16.2",
+    "albumentations==2.0.8",
+    "pandas==2.3.3",
+    "tqdm==4.67.1",
+    "matplotlib==3.10.6",
+    "seaborn==0.13.2",
+    "ollama==0.6.2",
+    "scikit-learn==1.6.1",
+]
+dev = [
+    "httpx==0.28.1",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Karthikreddy1010/Automatic_Labelling"
+Repository = "https://github.com/Karthikreddy1010/Automatic_Labelling"
+
+[project.scripts]
+# One command, from any directory, once installed.
+poleannotator = "backend.cli:main"
+
+[tool.setuptools]
+# `frontend` and `configs` hold no Python but are listed as packages so their
+# files install next to backend/ -- backend/app.py locates them at
+# <package parent>/frontend and <package parent>/configs, which holds for both
+# a checkout and an installed copy.
+packages = [
+    "backend",
+    "models",
+    "models.adapters",
+    "src",
+    "services",
+    "frontend",
+    "configs",
+]
+
+[tool.setuptools.package-data]
+frontend = ["*.html", "*.js", "*.css", "*.svg", "*.ico"]
+configs = ["*.yaml", "*.yml"]
