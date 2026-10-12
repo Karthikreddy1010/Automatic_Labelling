@@ -8,22 +8,47 @@ A local, high-performance AI annotation and auto-labeling platform specifically 
 
 ### 1. Install
 
-There are two supported installs. Pick by whether you need the AI pipeline.
-
-**Annotation only** -- the full manual labeling workspace, ~330 MB:
+**One command pulls the app and every library it needs** -- there is no separate
+"now install the requirements" step:
 
 ```bash
-pip install -r requirements-core.txt
+pip install .                      # from a clone
+pip install poleannotator-2.0.0-py3-none-any.whl   # or from a built wheel
 ```
 
-**Full stack** -- adds AI auto-labeling (torch, Grounding DINO, SAM, Qwen), several GB:
+Then run it from anywhere:
 
 ```bash
-pip install -r requirements.txt
+poleannotator                      # http://127.0.0.1:8000
+poleannotator --port 9000 --no-browser --data-dir /path/to/datasets
+```
+
+That installs the **annotation-only** stack (~330 MB). To add AI auto-labeling
+(torch, Grounding DINO, SAM, Qwen -- several GB, and practically a GPU):
+
+```bash
+pip install ".[ai]"
+```
+
+Working from a checkout instead, without installing? The requirements files
+still work and pin exactly the same versions:
+
+```bash
+pip install -r requirements-core.txt   # annotation only
+pip install -r requirements.txt        # full stack
+python run_backend.py
 ```
 
 `requirements.txt` is a superset of `requirements-core.txt` at identical pins,
-so you can start light and upgrade later without reinstalling anything.
+so you can start light and upgrade later without reinstalling anything. Tests
+assert that `pyproject.toml`, `requirements-core.txt` and `requirements.txt`
+cannot drift apart.
+
+To build the wheel yourself and hand it to someone:
+
+```bash
+pip install build && python -m build --wheel     # -> dist/*.whl
+```
 
 | | Annotation only | Full stack |
 |---|---|---|
@@ -40,7 +65,13 @@ server prints which mode it started in.
 
 ### 2. One-Command Launch
 
-In your terminal or PowerShell inside the repository directory:
+Installed, from any directory:
+
+```bash
+poleannotator
+```
+
+Or from a checkout:
 
 ```bash
 python run_backend.py
