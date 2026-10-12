@@ -148,9 +148,21 @@
   function build() {
     const overlay = document.createElement('div');
     overlay.className = 'tour-overlay';
-    overlay.innerHTML = `
-      <div class="tour-spotlight" aria-hidden="true"></div>
-      <div class="tour-card" role="dialog" aria-modal="true" aria-labelledby="tour-title">
+    overlay.innerHTML = '<div class="tour-spotlight" aria-hidden="true"></div>';
+
+    // The card is a SIBLING of the overlay, not a child. z-index only orders
+    // elements within one stacking context: nested inside the overlay (2000)
+    // the card could never paint above .tour-target (2001), whatever its own
+    // z-index said -- so a step whose card sits over its target, like the
+    // full-size canvas, had the target's content painted straight over the
+    // card. As siblings the real order holds: overlay 2000 < target 2001 <
+    // card 2002.
+    const card = document.createElement('div');
+    card.className = 'tour-card';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+    card.setAttribute('aria-labelledby', 'tour-title');
+    card.innerHTML = `
         <div class="tour-card-head">
           <span class="tour-counter"></span>
           <button type="button" class="tour-skip" title="End tour (Esc)">Skip tour</button>
@@ -163,43 +175,53 @@
             <button type="button" class="tour-btn tour-back">Back</button>
             <button type="button" class="tour-btn tour-btn-primary tour-next">Next</button>
           </div>
-        </div>
-      </div>`;
+        </div>`;
+
     document.body.appendChild(overlay);
+    document.body.appendChild(card);
 
     nodes = {
       overlay,
+      card,
       spotlight: overlay.querySelector('.tour-spotlight'),
-      card: overlay.querySelector('.tour-card'),
-      title: overlay.querySelector('.tour-title'),
-      body: overlay.querySelector('.tour-body'),
-      counter: overlay.querySelector('.tour-counter'),
-      progress: overlay.querySelector('.tour-progress-fill'),
-      back: overlay.querySelector('.tour-back'),
-      next: overlay.querySelector('.tour-next'),
-      skip: overlay.querySelector('.tour-skip'),
+      title: card.querySelector('.tour-title'),
+      body: card.querySelector('.tour-body'),
+      counter: card.querySelector('.tour-counter'),
+      progress: card.querySelector('.tour-progress-fill'),
+      back: card.querySelector('.tour-back'),
+      next: card.querySelector('.tour-next'),
+      skip: card.querySelector('.tour-skip'),
     };
 
     nodes.back.addEventListener('click', () => go(index - 1));
     nodes.next.addEventListener('click', () => go(index + 1));
     nodes.skip.addEventListener('click', () => stop(false));
     // Clicking the backdrop -- including over the highlighted element, which
-    // the tour makes click-through -- advances. Clicking the card must not.
+    // the tour makes click-through -- advances. The card is outside the
+    // overlay now, so its own clicks never reach this handler.
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) go(index + 1);
     });
-    nodes.card.addEventListener('click', (e) => e.stopPropagation());
     return nodes;
   }
 
   // ------------------------------------------------------------ placing
 
-  /** Centre the card and hide the spotlight -- for steps with no target. */
-  function placeCentred() {
-    nodes.spotlight.classList.add('tour-hidden');
+  /** Park the card in the middle of the screen. */
+  function centreCard() {
     nodes.card.classList.add('tour-card-centred');
     nodes.card.style.left = '';
     nodes.card.style.top = '';
+  }
+
+  function hideSpotlight() {
+    nodes.spotlight.classList.add('tour-hidden');
+  }
+
+  /** Centre the card with no highlight -- for steps that point at nothing. */
+  function placeCentred() {
+    hideSpotlight();
+    centreCard();
   }
 
   /**
@@ -234,7 +256,10 @@
     const order = [prefer, 'bottom', 'top', 'right', 'left'].filter(Boolean);
     const side = order.find(s => room[s] >= (s === 'top' || s === 'bottom' ? ch : cw));
 
-    if (!side) { placeCentred(); return; }
+    // No side has room (a target as large as the canvas). Centre the card over
+    // it rather than dropping the highlight -- the step is about that element,
+    // so losing its spotlight made the step look broken.
+    if (!side) { centreCard(); return; }
 
     let left;
     let top;
@@ -346,7 +371,7 @@
     if (lastHighlighted) lastHighlighted.classList.remove('tour-target');
     lastHighlighted = null;
     document.body.classList.remove('tour-running');
-    if (nodes) { nodes.overlay.remove(); nodes = null; }
+    if (nodes) { nodes.overlay.remove(); nodes.card.remove(); nodes = null; }
     if (completed) markSeen();
   }
 
